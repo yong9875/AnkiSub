@@ -1,0 +1,9 @@
+{
+    "audio_pad_before": 200,
+    "audio_pad_after": 200,
+    "screenshot_width": 320,
+    "merge_adjacent": true,
+    "merge_gap_ms": 400,
+    "filter_noise": true,
+    "default_model": "AnkiSub (Audio+Image)"
+}
