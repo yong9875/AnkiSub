@@ -341,7 +341,7 @@ class AnkiSubDialog(QDialog):
             self,
             "选择主字幕文件",
             "",
-            "字幕文件 (*.srt *.vtt *.ass *.ssa);;所有文件 (*.*)"
+            "所有字幕 (*.srt *.vtt *.ass *.ssa);;WebVTT 字幕 (*.vtt);;SubRip 字幕 (*.srt);;ASS/SSA 字幕 (*.ass *.ssa);;所有文件 (*.*)"
         )
         if path:
             self.edit_sub1.setText(path)
@@ -351,7 +351,7 @@ class AnkiSubDialog(QDialog):
             self,
             "选择副字幕文件 (译文)",
             "",
-            "字幕文件 (*.srt *.vtt *.ass *.ssa);;所有文件 (*.*)"
+            "所有字幕 (*.srt *.vtt *.ass *.ssa);;WebVTT 字幕 (*.vtt);;SubRip 字幕 (*.srt);;ASS/SSA 字幕 (*.ass *.ssa);;所有文件 (*.*)"
         )
         if path:
             self.edit_sub2.setText(path)
@@ -372,7 +372,8 @@ class AnkiSubDialog(QDialog):
             srt_content = extract_embedded_subtitle(video_path, track_idx)
             if not srt_content:
                 return []
-            return parse_subtitles_from_text(srt_content, "srt")
+            sub_format = "vtt" if "WEBVTT" in srt_content else "srt"
+            return parse_subtitles_from_text(srt_content, sub_format)
         else:
             file_edit = self.edit_sub1 if is_primary else self.edit_sub2
             path = file_edit.text().strip()

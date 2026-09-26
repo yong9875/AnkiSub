@@ -120,35 +120,36 @@ def probe_embedded_subtitles(video_path: str) -> List[Dict]:
 def extract_embedded_subtitle(video_path: str, sub_stream_index: int) -> Optional[str]:
     """
     Extract embedded subtitle stream into string content via ffmpeg.
-    Uses SRT format output pipe.
+    Uses SRT format output pipe, falling back to WebVTT if needed.
     """
     ffmpeg = FFMPEG_PATH or find_binary("ffmpeg")
     if not ffmpeg:
         return None
 
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-i", video_path,
-        "-map", f"0:s:{sub_stream_index}",
-        "-f", "srt",
-        "-"
-    ]
+    for fmt in ["srt", "webvtt"]:
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-i", video_path,
+            "-map", f"0:s:{sub_stream_index}",
+            "-f", fmt,
+            "-"
+        ]
 
-    try:
-        res = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='ignore',
-            creationflags=CREATE_NO_WINDOW
-        )
-        if res.returncode == 0 and res.stdout:
-            return res.stdout
-    except Exception as e:
-        print(f"[AnkiSub] extract_embedded_subtitle error: {e}")
-        
+        try:
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='ignore',
+                creationflags=CREATE_NO_WINDOW
+            )
+            if res.returncode == 0 and res.stdout and res.stdout.strip():
+                return res.stdout
+        except Exception as e:
+            print(f"[AnkiSub] extract_embedded_subtitle ({fmt}) error: {e}")
+            
     return None
 
 

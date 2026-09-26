@@ -5,27 +5,32 @@ Supports SRT, VTT, ASS/SSA formats, tag cleaning, noise filtering,
 adjacent line merging, and bilingual time alignment.
 """
 
+import os
 import re
+import html
 from typing import List, Dict, Optional, Tuple
 
 
 def time_to_ms(time_str: str) -> int:
-    """Convert timestamp (HH:MM:SS,mmm or HH:MM:SS.mmm or MM:SS.mmm) to milliseconds."""
-    time_str = time_str.strip().replace(',', '.')
-    parts = time_str.split(':')
-    if len(parts) == 3:
-        h = int(parts[0])
-        m = int(parts[1])
-        s_parts = parts[2].split('.')
-        s = int(s_parts[0])
-        ms = int(s_parts[1].ljust(3, '0')[:3]) if len(s_parts) > 1 else 0
-        return h * 3600000 + m * 60000 + s * 1000 + ms
-    elif len(parts) == 2:
-        m = int(parts[0])
-        s_parts = parts[1].split('.')
-        s = int(s_parts[0])
-        ms = int(s_parts[1].ljust(3, '0')[:3]) if len(s_parts) > 1 else 0
-        return m * 60000 + s * 1000 + ms
+    """Convert timestamp (HH:MM:SS,mmm or HH:MM:SS.mmm or MM:SS.mmm or MM:SS) to milliseconds."""
+    try:
+        time_str = time_str.strip().replace(',', '.')
+        parts = time_str.split(':')
+        if len(parts) == 3:
+            h = int(parts[0])
+            m = int(parts[1])
+            s_parts = parts[2].split('.')
+            s = int(s_parts[0])
+            ms = int(s_parts[1].ljust(3, '0')[:3]) if len(s_parts) > 1 else 0
+            return h * 3600000 + m * 60000 + s * 1000 + ms
+        elif len(parts) == 2:
+            m = int(parts[0])
+            s_parts = parts[1].split('.')
+            s = int(s_parts[0])
+            ms = int(s_parts[1].ljust(3, '0')[:3]) if len(s_parts) > 1 else 0
+            return m * 60000 + s * 1000 + ms
+    except (ValueError, IndexError):
+        pass
     return 0
 
 
@@ -43,13 +48,17 @@ def ms_to_time(ms: int, sep: str = ':') -> str:
 
 
 def clean_text(text: str) -> str:
-    """Remove formatting tags (ASS override tags, HTML tags) and normalize whitespace."""
+    """Remove formatting tags (ASS override tags, HTML/VTT tags) and normalize whitespace."""
+    # Unescape HTML entities (e.g., &amp; -> &, &#39; -> ', &nbsp; -> ' ')
+    text = html.unescape(text)
     # ASS tags: {\...}
     text = re.sub(r'\{[^\}]+\}', '', text)
-    # HTML tags: <...>
+    # HTML / WebVTT tags: <...> (including <v Roger>, <c.color>, <00:00.000>, <b>, </i>, <ruby>, <rt>, etc.)
     text = re.sub(r'<[^>]+>', '', text)
     # ASS newline escapes: \N or \n or \h (single or double escaped)
     text = re.sub(r'\\{1,2}[Nnh]', ' ', text)
+    # Replace non-breaking spaces with regular space
+    text = text.replace('\u00a0', ' ').replace('\u200b', '')
     # Normalize multiple newlines and spaces
     text = re.sub(r'\r\n|\r|\n', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
@@ -85,25 +94,107 @@ def is_sound_effect(text: str) -> bool:
     return False
 
 
+# Regex to match subtitle timestamp lines: supports both HH:MM:SS.mmm and MM:SS.mmm
+# with optional cue settings (e.g. line:0 position:20% align:start)
+TIMESTAMP_RE = re.compile(
+    r'^(?:.*?\s+)?((?:\d{1,2}:)?\d{1,2}:\d{2}(?:[.,]\d+)?)\s*-->\s*((?:\d{1,2}:)?\d{1,2}:\d{2}(?:[.,]\d+)?)'
+)
+
+
+def parse_vtt(content: str) -> List[Dict]:
+    """
+    Robust WebVTT subtitle parser.
+    Supports WEBVTT headers, cue identifiers, cue settings, NOTE comment blocks,
+    STYLE blocks, REGION blocks, and variable-precision timestamps.
+    """
+    items = []
+    # Strip UTF-8 BOM and normalize line endings
+    content = content.lstrip('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
+    lines = content.split('\n')
+    
+    i = 0
+    n = len(lines)
+    
+    # Skip WEBVTT header line if present
+    if i < n and lines[i].strip().upper().startswith('WEBVTT'):
+        i += 1
+        
+    in_note = False
+    in_style = False
+    in_region = False
+    
+    cur_start_ms = None
+    cur_end_ms = None
+    cur_text_lines = []
+    
+    def flush():
+        nonlocal cur_start_ms, cur_end_ms, cur_text_lines
+        if cur_start_ms is not None and cur_end_ms is not None and cur_text_lines:
+            raw_text = ' '.join(cur_text_lines)
+            cleaned = clean_text(raw_text)
+            if cleaned and cur_start_ms < cur_end_ms:
+                items.append({
+                    'start_ms': cur_start_ms,
+                    'end_ms': cur_end_ms,
+                    'text': cleaned
+                })
+        cur_start_ms = None
+        cur_end_ms = None
+        cur_text_lines = []
+        
+    while i < n:
+        line = lines[i].strip()
+        i += 1
+        
+        # Blank line delimits blocks
+        if not line:
+            in_note = False
+            in_style = False
+            in_region = False
+            flush()
+            continue
+            
+        # Metadata / block headers
+        if line.upper().startswith('NOTE'):
+            in_note = True
+            flush()
+            continue
+        if line.upper().startswith('STYLE'):
+            in_style = True
+            flush()
+            continue
+        if line.upper().startswith('REGION'):
+            in_region = True
+            flush()
+            continue
+            
+        if in_note or in_style or in_region:
+            continue
+            
+        # Check for timestamp line
+        m = TIMESTAMP_RE.search(line)
+        if m:
+            flush()
+            cur_start_ms = time_to_ms(m.group(1))
+            cur_end_ms = time_to_ms(m.group(2))
+            continue
+            
+        # Active cue text payload
+        if cur_start_ms is not None:
+            cur_text_lines.append(line)
+            
+    flush()
+    return items
+
+
+def parse_srt(content: str) -> List[Dict]:
+    """Parse SubRip (SRT) format."""
+    return parse_vtt(content)
+
+
 def parse_srt_or_vtt(content: str) -> List[Dict]:
     """Parse SRT or WebVTT content."""
-    items = []
-    # Match blocks with timestamp: 00:00:00.000 --> 00:00:00.000
-    pattern = re.compile(
-        r'(\d{1,2}:\d{2}:\d{2}[,\.]\d{3}|\d{1,2}:\d{2}[,\.]\d{3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,\.]\d{3}|\d{1,2}:\d{2}[,\.]\d{3})[^\r\n]*\r?\n([\s\S]*?)(?=\r?\n\s*\r?\n|\Z)'
-    )
-    for match in pattern.finditer(content):
-        start_str, end_str, text_block = match.groups()
-        start_ms = time_to_ms(start_str)
-        end_ms = time_to_ms(end_str)
-        text = clean_text(text_block)
-        if start_ms < end_ms and text:
-            items.append({
-                'start_ms': start_ms,
-                'end_ms': end_ms,
-                'text': text
-            })
-    return items
+    return parse_vtt(content)
 
 
 def parse_ass(content: str) -> List[Dict]:
@@ -170,12 +261,14 @@ def parse_subtitles_from_text(content: str, ext: str = "srt") -> List[Dict]:
     ext = ext.lower().lstrip('.')
     if ext in ['ass', 'ssa']:
         return parse_ass(content)
+    elif ext in ['vtt', 'webvtt']:
+        return parse_vtt(content)
     else:
         return parse_srt_or_vtt(content)
 
 
 def parse_subtitle_file(filepath: str) -> List[Dict]:
-    """Read and parse an external subtitle file."""
+    """Read and parse an external subtitle file (.srt, .vtt, .ass, .ssa)."""
     encodings = ['utf-8-sig', 'utf-8', 'gb18030', 'big5', 'shift_jis', 'cp1252', 'latin1']
     content = None
     for enc in encodings:
@@ -190,7 +283,7 @@ def parse_subtitle_file(filepath: str) -> List[Dict]:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
             
-    ext = filepath.split('.')[-1]
+    ext = os.path.splitext(filepath)[1].lower().lstrip('.')
     return parse_subtitles_from_text(content, ext)
 
 
