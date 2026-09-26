@@ -94,6 +94,28 @@ def is_sound_effect(text: str) -> bool:
     return False
 
 
+# Sentence terminators and common abbreviation whitelist to prevent false splits
+SENTENCE_TERMINATORS = ('.', '?', '!', '。', '？', '！', '…')
+ABBREVIATIONS = {
+    'mr', 'mrs', 'ms', 'dr', 'prof', 'vs', 'etc', 'eg', 'ie', 'no', 'vol', 'st', 'jr', 'sr', 'approx', 'dept'
+}
+
+
+def ends_with_sentence_terminal(text: str) -> bool:
+    """Check if text ends with a true sentence terminator, avoiding abbreviations like Dr. or Mr."""
+    t = text.rstrip().rstrip('"\'”)』」')
+    if not t:
+        return False
+    if not t.endswith(SENTENCE_TERMINATORS):
+        return False
+    words = t.split()
+    if words:
+        last_word = words[-1].lower().rstrip('.?!')
+        if last_word in ABBREVIATIONS:
+            return False
+    return True
+
+
 # Regex to match subtitle timestamp lines: supports both HH:MM:SS.mmm and MM:SS.mmm
 # with optional cue settings (e.g. line:0 position:20% align:start)
 TIMESTAMP_RE = re.compile(
@@ -101,12 +123,77 @@ TIMESTAMP_RE = re.compile(
 )
 
 
+def parse_vtt_word_level(raw_cues: List[Dict]) -> List[Dict]:
+    """
+    Reconstruct exact, grammatically complete sentences from word-level VTT
+    (e.g. YouTube auto-captions and Whisper word-timestamped VTT).
+    Builds continuous word stream and cuts cleanly at sentence-ending punctuation.
+    """
+    words = []
+    for c in raw_cues:
+        # Ignore 10ms-50ms flash transition cues
+        if c['end_ms'] - c['start_ms'] <= 50:
+            continue
+        tag_lines = [l for l in c['lines'] if '<' in l]
+        if not tag_lines:
+            continue
+        line = tag_lines[-1]  # The newly spoken speech line
+        
+        # Tokenize by <HH:MM:SS.mmm>
+        tokens = re.split(r'<(\d{2}:\d{2}:\d{2}\.\d{3})>', line)
+        w0 = clean_text(tokens[0])
+        if w0:
+            t0 = c['start_ms']
+            t1 = time_to_ms(tokens[1]) if len(tokens) > 1 else c['end_ms']
+            words.append({'word': w0, 'start_ms': t0, 'end_ms': t1})
+            
+        for k in range(1, len(tokens), 2):
+            t_start = time_to_ms(tokens[k])
+            t_end = time_to_ms(tokens[k+2]) if k+2 < len(tokens) else c['end_ms']
+            w = clean_text(tokens[k+1])
+            if w:
+                words.append({'word': w, 'start_ms': t_start, 'end_ms': t_end})
+
+    if not words:
+        return []
+
+    sentences = []
+    cur_words = []
+    for w in words:
+        cur_words.append(w)
+        # Check if the word finishes a sentence
+        if ends_with_sentence_terminal(w['word']):
+            s_text = " ".join(item['word'] for item in cur_words)
+            s_start = cur_words[0]['start_ms']
+            s_end = cur_words[-1]['end_ms']
+            if s_start < s_end:
+                sentences.append({
+                    'start_ms': s_start,
+                    'end_ms': s_end,
+                    'text': s_text
+                })
+            cur_words = []
+
+    if cur_words:
+        s_text = " ".join(item['word'] for item in cur_words)
+        s_start = cur_words[0]['start_ms']
+        s_end = cur_words[-1]['end_ms']
+        if s_start < s_end and s_text:
+            sentences.append({
+                'start_ms': s_start,
+                'end_ms': s_end,
+                'text': s_text
+            })
+
+    return sentences
+
+
 def parse_vtt(content: str) -> List[Dict]:
     """
     Robust WebVTT subtitle parser.
     Supports WEBVTT headers, cue identifiers, cue settings, NOTE comment blocks,
-    STYLE blocks, REGION blocks, variable-precision timestamps, and auto-deduplication
-    for YouTube-style rolling / sliding-window captions.
+    STYLE blocks, REGION blocks, variable-precision timestamps, and auto-reconstruction
+    for YouTube-style word-timestamped captions.
     """
     raw_cues = []
     # Strip UTF-8 BOM and normalize line endings
@@ -194,24 +281,19 @@ def parse_vtt(content: str) -> List[Dict]:
         for c in raw_cues
     )
 
+    if is_yt_rolling:
+        sentences = parse_vtt_word_level(raw_cues)
+        if sentences:
+            return sentences
+
+    # Fallback / standard VTT
     items = []
     prev_text = ""
     for c in raw_cues:
-        dur = c['end_ms'] - c['start_ms']
-        if is_yt_rolling:
-            # In YouTube auto-captions, ignore short flash cues (<= 50ms)
-            if dur <= 50:
-                continue
-            # Pick the line with word tags (newly introduced text)
-            new_lines = [l for l in c['lines'] if '<' in l] or c['lines']
-        else:
-            new_lines = c['lines']
-            
-        text = clean_text(' '.join(new_lines))
+        text = clean_text(' '.join(c['lines']))
         if not text or c['start_ms'] >= c['end_ms']:
             continue
             
-        # Avoid duplicate consecutive lines
         if text == prev_text:
             continue
             
@@ -325,55 +407,78 @@ def parse_subtitle_file(filepath: str) -> List[Dict]:
     return parse_subtitles_from_text(content, ext)
 
 
+def join_subtitle_texts(t1: str, t2: str) -> str:
+    """Intelligently join subtitle texts respecting CJK characters without superfluous spaces."""
+    t1 = t1.strip()
+    t2 = t2.strip()
+    if not t1:
+        return t2
+    if not t2:
+        return t1
+    c1 = t1[-1]
+    c2 = t2[0]
+    is_cjk = (
+        ('\u4e00' <= c1 <= '\u9fff') or ('\u4e00' <= c2 <= '\u9fff') or
+        ('\u3040' <= c1 <= '\u30ff') or ('\u3040' <= c2 <= '\u30ff') or
+        ('\uac00' <= c1 <= '\ud7af') or ('\uac00' <= c2 <= '\ud7af')
+    )
+    if is_cjk:
+        return f"{t1}{t2}"
+    return f"{t1} {t2}"
+
+
 def merge_adjacent_subtitles(
     items: List[Dict],
     max_gap_ms: int = 400,
-    max_duration_ms: int = 8000
+    max_duration_ms: int = 15000
 ) -> List[Dict]:
     """
     Merge short adjacent dialogue fragments into natural, complete phrases.
-    Guards against over-merging by checking:
-    1. Maximum phrase duration cap (default 8000ms / 8s).
-    2. Sentence-ending punctuation (., ?, !, etc.).
-    3. Rolling subtitle redundancy / duplicate prefix.
+    
+    Punctuation-Driven Boundary Strategy:
+    1. Sentence-Complete Preservation: If current subtitle ends with terminal
+       punctuation (., ?, !, etc.), it is preserved as an independent card
+       and NOT arbitrarily merged into subsequent sentences.
+    2. Incomplete Fragment Continuation: If current subtitle does NOT end with
+       terminal punctuation (e.g. ends with comma, dash, conjunction, or mid-sentence),
+       it continues merging with adjacent cues across natural pauses (up to 1000ms gap)
+       until a sentence terminator is reached or max_duration_ms (default 15s) is hit.
+    3. Rolling subtitle redundancy / duplicate prefix handling.
+    4. CJK-aware text joining without unnatural spaces.
     """
     if not items:
         return []
-        
-    sentence_ends = ('.', '?', '!', '。', '？', '！', '…')
+
     merged = []
     current = items[0].copy()
-    
+
     for next_item in items[1:]:
         gap = next_item['start_ms'] - current['end_ms']
         combined_dur = next_item['end_ms'] - current['start_ms']
-        current_dur = current['end_ms'] - current['start_ms']
-        ends_sentence = current['text'].rstrip().endswith(sentence_ends)
-        
-        # Merge if:
-        # - Gap between segments is within threshold
-        # - Total combined duration won't exceed max_duration_ms
-        # - Current phrase is not already an ended sentence (unless it was a very brief utterance < 1.5s)
-        can_merge = (
-            0 <= gap <= max_gap_ms
-            and combined_dur <= max_duration_ms
-            and (not ends_sentence or current_dur < 1500)
-        )
-        
+        is_finished = ends_with_sentence_terminal(current['text'])
+
+        can_merge = False
+        if not is_finished:
+            # Tolerant gap for sentence continuation (allows natural pause up to 1000ms or max_gap_ms)
+            allowed_gap = max(max_gap_ms, 1000)
+            if -200 <= gap <= allowed_gap and combined_dur <= max_duration_ms:
+                can_merge = True
+
         if can_merge:
             next_text = next_item['text'].strip()
             # If next_text already includes current text (rolling caption artifact)
             if next_text.startswith(current['text']):
                 current['text'] = next_text
             elif not current['text'].endswith(next_text):
-                current['text'] = f"{current['text']} {next_text}".strip()
+                current['text'] = join_subtitle_texts(current['text'], next_text)
             current['end_ms'] = max(current['end_ms'], next_item['end_ms'])
         else:
             merged.append(current)
             current = next_item.copy()
-            
+
     merged.append(current)
     return merged
+
 
 
 def filter_noise_subtitles(items: List[Dict], min_duration_ms: int = 400) -> List[Dict]:

@@ -50,6 +50,7 @@ class AnkiSubDialog(QDialog):
         self.cfg_screenshot_width = config.get("screenshot_width", 320)
         self.cfg_merge_adjacent = config.get("merge_adjacent", True)
         self.cfg_merge_gap_ms = config.get("merge_gap_ms", 400)
+        self.cfg_merge_max_duration_ms = config.get("merge_max_duration_ms", 15000)
         self.cfg_filter_noise = config.get("filter_noise", True)
         self.cfg_default_model = config.get("default_model", "AnkiSub (Audio+Image)")
 
@@ -405,7 +406,11 @@ class AnkiSubDialog(QDialog):
 
             # 3. Merge adjacent
             if self.check_merge_adjacent.isChecked():
-                primary_items = merge_adjacent_subtitles(primary_items, self.cfg_merge_gap_ms)
+                primary_items = merge_adjacent_subtitles(
+                    primary_items,
+                    max_gap_ms=self.cfg_merge_gap_ms,
+                    max_duration_ms=self.cfg_merge_max_duration_ms
+                )
 
             # 4. Secondary subtitles (Translation)
             secondary_items = []
@@ -413,6 +418,12 @@ class AnkiSubDialog(QDialog):
                 secondary_items = self._get_sub_items(is_primary=False)
                 if self.check_filter_noise.isChecked():
                     secondary_items = filter_noise_subtitles(secondary_items)
+                if self.check_merge_adjacent.isChecked():
+                    secondary_items = merge_adjacent_subtitles(
+                        secondary_items,
+                        max_gap_ms=self.cfg_merge_gap_ms,
+                        max_duration_ms=self.cfg_merge_max_duration_ms
+                    )
 
             # 5. Align
             self.parsed_items = align_bilingual_subtitles(primary_items, secondary_items)

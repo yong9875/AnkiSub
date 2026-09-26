@@ -4,6 +4,8 @@
     "screenshot_width": 320,
     "merge_adjacent": true,
     "merge_gap_ms": 400,
+    "merge_max_duration_ms": 15000,
     "filter_noise": true,
     "default_model": "AnkiSub (Audio+Image)"
 }
+
