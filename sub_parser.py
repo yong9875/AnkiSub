@@ -105,9 +105,10 @@ def parse_vtt(content: str) -> List[Dict]:
     """
     Robust WebVTT subtitle parser.
     Supports WEBVTT headers, cue identifiers, cue settings, NOTE comment blocks,
-    STYLE blocks, REGION blocks, and variable-precision timestamps.
+    STYLE blocks, REGION blocks, variable-precision timestamps, and auto-deduplication
+    for YouTube-style rolling / sliding-window captions.
     """
-    items = []
+    raw_cues = []
     # Strip UTF-8 BOM and normalize line endings
     content = content.lstrip('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
     lines = content.split('\n')
@@ -130,14 +131,11 @@ def parse_vtt(content: str) -> List[Dict]:
     def flush():
         nonlocal cur_start_ms, cur_end_ms, cur_text_lines
         if cur_start_ms is not None and cur_end_ms is not None and cur_text_lines:
-            raw_text = ' '.join(cur_text_lines)
-            cleaned = clean_text(raw_text)
-            if cleaned and cur_start_ms < cur_end_ms:
-                items.append({
-                    'start_ms': cur_start_ms,
-                    'end_ms': cur_end_ms,
-                    'text': cleaned
-                })
+            raw_cues.append({
+                'start_ms': cur_start_ms,
+                'end_ms': cur_end_ms,
+                'lines': cur_text_lines
+            })
         cur_start_ms = None
         cur_end_ms = None
         cur_text_lines = []
@@ -146,12 +144,22 @@ def parse_vtt(content: str) -> List[Dict]:
         line = lines[i].strip()
         i += 1
         
-        # Blank line delimits blocks
+        # Check for timestamp line FIRST before empty line check
+        m = TIMESTAMP_RE.search(line)
+        if m:
+            flush()
+            cur_start_ms = time_to_ms(m.group(1))
+            cur_end_ms = time_to_ms(m.group(2))
+            continue
+            
+        # Blank line
         if not line:
             in_note = False
             in_style = False
             in_region = False
-            flush()
+            # Only flush if we have already captured text lines for the current cue
+            if cur_text_lines:
+                flush()
             continue
             
         # Metadata / block headers
@@ -171,19 +179,49 @@ def parse_vtt(content: str) -> List[Dict]:
         if in_note or in_style or in_region:
             continue
             
-        # Check for timestamp line
-        m = TIMESTAMP_RE.search(line)
-        if m:
-            flush()
-            cur_start_ms = time_to_ms(m.group(1))
-            cur_end_ms = time_to_ms(m.group(2))
-            continue
-            
         # Active cue text payload
         if cur_start_ms is not None:
             cur_text_lines.append(line)
             
     flush()
+    
+    if not raw_cues:
+        return []
+
+    # Check if this is a YouTube auto-caption rolling VTT (contains <c> or <HH:MM:SS.mmm> word timestamps)
+    is_yt_rolling = any(
+        any('<c>' in l or re.search(r'<\d{2}:\d{2}', l) for l in c['lines'])
+        for c in raw_cues
+    )
+
+    items = []
+    prev_text = ""
+    for c in raw_cues:
+        dur = c['end_ms'] - c['start_ms']
+        if is_yt_rolling:
+            # In YouTube auto-captions, ignore short flash cues (<= 50ms)
+            if dur <= 50:
+                continue
+            # Pick the line with word tags (newly introduced text)
+            new_lines = [l for l in c['lines'] if '<' in l] or c['lines']
+        else:
+            new_lines = c['lines']
+            
+        text = clean_text(' '.join(new_lines))
+        if not text or c['start_ms'] >= c['end_ms']:
+            continue
+            
+        # Avoid duplicate consecutive lines
+        if text == prev_text:
+            continue
+            
+        items.append({
+            'start_ms': c['start_ms'],
+            'end_ms': c['end_ms'],
+            'text': text
+        })
+        prev_text = text
+
     return items
 
 
@@ -287,24 +325,49 @@ def parse_subtitle_file(filepath: str) -> List[Dict]:
     return parse_subtitles_from_text(content, ext)
 
 
-def merge_adjacent_subtitles(items: List[Dict], max_gap_ms: int = 400) -> List[Dict]:
+def merge_adjacent_subtitles(
+    items: List[Dict],
+    max_gap_ms: int = 400,
+    max_duration_ms: int = 8000
+) -> List[Dict]:
     """
-    Merge subtitles where the time gap between sentence end and next sentence start
-    is less than or equal to max_gap_ms, combining fragments into complete phrases.
+    Merge short adjacent dialogue fragments into natural, complete phrases.
+    Guards against over-merging by checking:
+    1. Maximum phrase duration cap (default 8000ms / 8s).
+    2. Sentence-ending punctuation (., ?, !, etc.).
+    3. Rolling subtitle redundancy / duplicate prefix.
     """
     if not items:
         return []
         
+    sentence_ends = ('.', '?', '!', '。', '？', '！', '…')
     merged = []
     current = items[0].copy()
     
     for next_item in items[1:]:
         gap = next_item['start_ms'] - current['end_ms']
-        # Check if they are adjacent and can be merged
-        if 0 <= gap <= max_gap_ms:
-            # Merge
+        combined_dur = next_item['end_ms'] - current['start_ms']
+        current_dur = current['end_ms'] - current['start_ms']
+        ends_sentence = current['text'].rstrip().endswith(sentence_ends)
+        
+        # Merge if:
+        # - Gap between segments is within threshold
+        # - Total combined duration won't exceed max_duration_ms
+        # - Current phrase is not already an ended sentence (unless it was a very brief utterance < 1.5s)
+        can_merge = (
+            0 <= gap <= max_gap_ms
+            and combined_dur <= max_duration_ms
+            and (not ends_sentence or current_dur < 1500)
+        )
+        
+        if can_merge:
+            next_text = next_item['text'].strip()
+            # If next_text already includes current text (rolling caption artifact)
+            if next_text.startswith(current['text']):
+                current['text'] = next_text
+            elif not current['text'].endswith(next_text):
+                current['text'] = f"{current['text']} {next_text}".strip()
             current['end_ms'] = max(current['end_ms'], next_item['end_ms'])
-            current['text'] = f"{current['text']} {next_item['text']}".strip()
         else:
             merged.append(current)
             current = next_item.copy()
