@@ -22,3 +22,4 @@ desktop.ini
 *.log
 *.tmp
 temp/
+test/

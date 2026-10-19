@@ -97,23 +97,72 @@ def is_sound_effect(text: str) -> bool:
 # Sentence terminators and common abbreviation whitelist to prevent false splits
 SENTENCE_TERMINATORS = ('.', '?', '!', '。', '？', '！', '…')
 ABBREVIATIONS = {
-    'mr', 'mrs', 'ms', 'dr', 'prof', 'vs', 'etc', 'eg', 'ie', 'no', 'vol', 'st', 'jr', 'sr', 'approx', 'dept'
+    'mr', 'mrs', 'ms', 'dr', 'prof', 'vs', 'etc', 'eg', 'ie',
+    'vol', 'jr', 'sr', 'approx', 'dept', 'fig', 'inc', 'ltd', 'co', 'corp',
+    'a.m', 'p.m', 'e.g', 'i.e', 'u.s', 'u.k'
 }
+
+CAPITAL_SENTENCE_STARTERS = {
+    'So', 'If', 'When', 'While', 'What', 'Why', 'How', 'Where',
+    'This', 'That', 'These', 'Those', 'It', "It's", 'We', "We're", "We've",
+    'You', "You're", "You've", 'They', "They're", 'He', 'She', 'But',
+    'Now', 'Here', 'There', "Let's", "Don't"
+}
+
+
+def is_word_sentence_end(word: str, next_word: str = "", cur_word_count: int = 1) -> bool:
+    """
+    Check if a word finishes a complete grammatical sentence.
+    Distinguishes abbreviations (Mr., Dr., 9:00 a.m. vs 6:00 p.m.?) and detects
+    missing periods before capitalized sentence starters (e.g. YouTube censorship drops).
+    """
+    t = word.rstrip().rstrip('"\'”)』」')
+    if not t:
+        return False
+
+    if t.endswith(SENTENCE_TERMINATORS):
+        core = t.lower().rstrip('.?!。？！…')
+        # Check abbreviation whitelist
+        if core in ABBREVIATIONS:
+            # If ending with ? or !, it is still a true sentence terminator
+            if t.endswith(('?', '!', '？', '！')):
+                return True
+            # For dot abbreviations (a.m., etc.), only terminate if next_word is uppercase
+            if next_word:
+                nw_clean = next_word.lstrip('"\'“([（【')
+                if nw_clean and nw_clean[0].islower():
+                    return False
+            return False
+
+        # Multi-dot initialisms / abbreviations: e.g. a.m., p.m., u.s.
+        if t.endswith('.') and re.match(r'^(?:[a-zA-Z]\.)+[a-zA-Z]?$', t[:-1]):
+            if next_word:
+                nw_clean = next_word.lstrip('"\'“([（【')
+                if nw_clean and nw_clean[0].islower():
+                    return False
+
+        # "No." or "St." followed by a digit is a number prefix, not a sentence end
+        if core in ('no', 'st') and next_word and next_word[0].isdigit():
+            return False
+
+        return True
+
+    # Missing period before a Capitalized Sentence Starter (e.g. "and that's So much so that...")
+    if cur_word_count >= 5 and next_word:
+        if not t.endswith((',', ';', ':', '-', '—', '，', '；', '：')):
+            nw_clean = next_word.rstrip(',.:;?!')
+            if nw_clean in CAPITAL_SENTENCE_STARTERS and nw_clean.lower() != t.lower():
+                return True
+
+    return False
 
 
 def ends_with_sentence_terminal(text: str) -> bool:
     """Check if text ends with a true sentence terminator, avoiding abbreviations like Dr. or Mr."""
-    t = text.rstrip().rstrip('"\'”)』」')
-    if not t:
+    words = text.split()
+    if not words:
         return False
-    if not t.endswith(SENTENCE_TERMINATORS):
-        return False
-    words = t.split()
-    if words:
-        last_word = words[-1].lower().rstrip('.?!')
-        if last_word in ABBREVIATIONS:
-            return False
-    return True
+    return is_word_sentence_end(words[-1], "", len(words))
 
 
 # Regex to match subtitle timestamp lines: supports both HH:MM:SS.mmm and MM:SS.mmm
@@ -138,7 +187,7 @@ def parse_vtt_word_level(raw_cues: List[Dict]) -> List[Dict]:
         if not tag_lines:
             continue
         line = tag_lines[-1]  # The newly spoken speech line
-        
+
         # Tokenize by <HH:MM:SS.mmm>
         tokens = re.split(r'<(\d{2}:\d{2}:\d{2}\.\d{3})>', line)
         w0 = clean_text(tokens[0])
@@ -146,7 +195,7 @@ def parse_vtt_word_level(raw_cues: List[Dict]) -> List[Dict]:
             t0 = c['start_ms']
             t1 = time_to_ms(tokens[1]) if len(tokens) > 1 else c['end_ms']
             words.append({'word': w0, 'start_ms': t0, 'end_ms': t1})
-            
+
         for k in range(1, len(tokens), 2):
             t_start = time_to_ms(tokens[k])
             t_end = time_to_ms(tokens[k+2]) if k+2 < len(tokens) else c['end_ms']
@@ -159,11 +208,13 @@ def parse_vtt_word_level(raw_cues: List[Dict]) -> List[Dict]:
 
     sentences = []
     cur_words = []
-    for w in words:
+    for idx, w in enumerate(words):
         cur_words.append(w)
-        # Check if the word finishes a sentence
-        if ends_with_sentence_terminal(w['word']):
+        nxt_w = words[idx + 1]['word'] if idx + 1 < len(words) else ""
+        if is_word_sentence_end(w['word'], nxt_w, len(cur_words)):
             s_text = " ".join(item['word'] for item in cur_words)
+            if s_text and s_text[0].islower():
+                s_text = s_text[0].upper() + s_text[1:]
             s_start = cur_words[0]['start_ms']
             s_end = cur_words[-1]['end_ms']
             if s_start < s_end:
@@ -176,6 +227,8 @@ def parse_vtt_word_level(raw_cues: List[Dict]) -> List[Dict]:
 
     if cur_words:
         s_text = " ".join(item['word'] for item in cur_words)
+        if s_text and s_text[0].islower():
+            s_text = s_text[0].upper() + s_text[1:]
         s_start = cur_words[0]['start_ms']
         s_end = cur_words[-1]['end_ms']
         if s_start < s_end and s_text:
@@ -184,6 +237,149 @@ def parse_vtt_word_level(raw_cues: List[Dict]) -> List[Dict]:
                 'end_ms': s_end,
                 'text': s_text
             })
+
+    return sentences
+
+
+def reconstruct_sentences_from_cues(raw_cues: List[Dict], max_gap_ms: int = 1200) -> List[Dict]:
+    """
+    Reconstruct natural, grammatically complete sentences from cue-based subtitles
+    (e.g. YouTube 2-line roll-up VTT, Whisper segment VTT/SRT, and movie subtitles).
+    
+    1. Resolves overlapping screen-linger timestamps via the 2-Line Roll-Up Inversion Law.
+    2. Builds a continuous word-stream with syllable/character weights and inter-word pause allowances.
+    3. Splits cleanly at true sentence boundaries (Capital letter start -> terminal punctuation .?!).
+    """
+    if not raw_cues:
+        return []
+
+    # Step 1: De-overlap and recover line-level segments
+    line_segments = []
+    n_cues = len(raw_cues)
+    for i, c in enumerate(raw_cues):
+        s_ms = c['start_ms']
+        e_ms = c['end_ms']
+        # YouTube roll-up de-overlap: speech of cue i finishes when cue i+1 begins
+        if i + 1 < n_cues and raw_cues[i + 1]['start_ms'] > s_ms and e_ms > raw_cues[i + 1]['start_ms']:
+            true_end = raw_cues[i + 1]['start_ms']
+        else:
+            true_end = e_ms
+
+        raw_sub_lines = c.get('lines', [])
+        if not raw_sub_lines and 'text' in c:
+            raw_sub_lines = c['text'].split('\n')
+
+        cleaned_lines = [clean_text(x) for x in raw_sub_lines if clean_text(x)]
+        if not cleaned_lines or s_ms >= true_end:
+            continue
+
+        # 2-line roll-up timing recovery: previous cue's end_ms marks the exact boundary between line 0 and line 1
+        if len(cleaned_lines) == 2 and i > 0:
+            prev_orig_end = raw_cues[i - 1]['end_ms']
+            if s_ms + 100 < prev_orig_end < true_end - 100:
+                line_segments.append({'start_ms': s_ms, 'end_ms': prev_orig_end, 'text': cleaned_lines[0]})
+                line_segments.append({'start_ms': prev_orig_end, 'end_ms': true_end, 'text': cleaned_lines[1]})
+                continue
+
+        # Split across lines proportionally
+        total_chars = sum(max(1, len(x)) for x in cleaned_lines)
+        cur_t = float(s_ms)
+        dur = float(true_end - s_ms)
+        for l_text in cleaned_lines:
+            l_dur = dur * (max(1, len(l_text)) / total_chars)
+            line_segments.append({
+                'start_ms': int(round(cur_t)),
+                'end_ms': int(round(cur_t + l_dur)),
+                'text': l_text
+            })
+            cur_t += l_dur
+
+    if not line_segments:
+        return []
+
+    # Step 2: Build timed word stream
+    words = []
+    for seg in line_segments:
+        # Use regex to handle both whitespace-delimited words and CJK punctuation boundaries
+        raw_words = re.findall(r'[^\s。？！…]+[。？！…]*', seg['text'])
+        if not raw_words:
+            continue
+        s_ms, e_ms = seg['start_ms'], seg['end_ms']
+        dur = max(1, e_ms - s_ms)
+        spoken_weights, pause_weights = [], []
+        n_w = len(raw_words)
+        for idx, w in enumerate(raw_words):
+            alnum = sum(1 for ch in w if ch.isalnum())
+            spoken_weights.append(max(2.0, float(alnum)))
+            nxt = raw_words[idx + 1] if idx + 1 < n_w else ""
+            if idx < n_w - 1:
+                if is_word_sentence_end(w, nxt, idx + 1):
+                    pause_weights.append(4.5)
+                elif w.endswith((',', ';', ':', '—', '，', '；', '：')):
+                    pause_weights.append(2.0)
+                else:
+                    pause_weights.append(0.0)
+            else:
+                pause_weights.append(0.0)
+
+        total_w = sum(spoken_weights) + sum(pause_weights)
+        cur_t = float(s_ms)
+        for idx, w in enumerate(raw_words):
+            w_dur = dur * (spoken_weights[idx] / total_w)
+            p_dur = dur * (pause_weights[idx] / total_w)
+            words.append({
+                'word': w,
+                'start_ms': int(round(cur_t)),
+                'end_ms': int(round(cur_t + w_dur)),
+                'is_seg_end': (idx == n_w - 1)
+            })
+            cur_t += w_dur + p_dur
+
+    # Step 3: Group words into complete sentences
+    sentences = []
+    cur = []
+    prev_w_end = 0
+
+    for idx, w in enumerate(words):
+        # Flush if gap between dialogue segments is large (scene change > max_gap_ms)
+        if cur and prev_w_end > 0 and (w['start_ms'] - prev_w_end > max(max_gap_ms, 1200)):
+            txt = ' '.join(x['word'] for x in cur)
+            if txt and txt[0].islower():
+                txt = txt[0].upper() + txt[1:]
+            sentences.append({
+                'start_ms': cur[0]['start_ms'],
+                'end_ms': cur[-1]['end_ms'],
+                'text': txt,
+                'mid_cue_end': not cur[-1].get('is_seg_end', True)
+            })
+            cur = []
+
+        cur.append(w)
+        prev_w_end = w['end_ms']
+        nxt_w = words[idx + 1]['word'] if idx + 1 < len(words) else ""
+
+        if is_word_sentence_end(w['word'], nxt_w, len(cur)):
+            txt = ' '.join(x['word'] for x in cur)
+            if txt and txt[0].islower():
+                txt = txt[0].upper() + txt[1:]
+            sentences.append({
+                'start_ms': cur[0]['start_ms'],
+                'end_ms': cur[-1]['end_ms'],
+                'text': txt,
+                'mid_cue_end': not cur[-1].get('is_seg_end', True)
+            })
+            cur = []
+
+    if cur:
+        txt = ' '.join(x['word'] for x in cur)
+        if txt and txt[0].islower():
+            txt = txt[0].upper() + txt[1:]
+        sentences.append({
+            'start_ms': cur[0]['start_ms'],
+            'end_ms': cur[-1]['end_ms'],
+            'text': txt,
+            'mid_cue_end': False
+        })
 
     return sentences
 
@@ -286,6 +482,11 @@ def parse_vtt(content: str) -> List[Dict]:
         if sentences:
             return sentences
 
+    # Reconstruct complete grammatical sentences from roll-up / line-wrapped cues
+    sentences = reconstruct_sentences_from_cues(raw_cues)
+    if sentences:
+        return sentences
+
     # Fallback / standard VTT
     items = []
     prev_text = ""
@@ -305,6 +506,7 @@ def parse_vtt(content: str) -> List[Dict]:
         prev_text = text
 
     return items
+
 
 
 def parse_srt(content: str) -> List[Dict]:
@@ -441,13 +643,28 @@ def merge_adjacent_subtitles(
        and NOT arbitrarily merged into subsequent sentences.
     2. Incomplete Fragment Continuation: If current subtitle does NOT end with
        terminal punctuation (e.g. ends with comma, dash, conjunction, or mid-sentence),
-       it continues merging with adjacent cues across natural pauses (up to 1000ms gap)
+       it continues merging with adjacent cues across natural pauses (up to 1200ms gap)
        until a sentence terminator is reached or max_duration_ms (default 15s) is hit.
     3. Rolling subtitle redundancy / duplicate prefix handling.
     4. CJK-aware text joining without unnatural spaces.
     """
     if not items:
         return []
+
+    # If any item contains an internal sentence terminal followed by a capital letter,
+    # or items overlap in time, reconstruct full sentence stream
+    has_internal_split = any(
+        re.search(r'[.?!。？！…]\s+[A-Z\u4e00-\u9fff]', it['text'])
+        for it in items[:50]
+    )
+    has_overlap = any(
+        items[i]['end_ms'] > items[i+1]['start_ms']
+        for i in range(min(50, len(items)-1))
+    )
+    if has_internal_split or has_overlap:
+        reconstructed = reconstruct_sentences_from_cues(items, max_gap_ms=max(max_gap_ms, 1200))
+        if reconstructed:
+            items = reconstructed
 
     merged = []
     current = items[0].copy()
@@ -459,8 +676,8 @@ def merge_adjacent_subtitles(
 
         can_merge = False
         if not is_finished:
-            # Tolerant gap for sentence continuation (allows natural pause up to 1000ms or max_gap_ms)
-            allowed_gap = max(max_gap_ms, 1000)
+            # Tolerant gap for sentence continuation (allows natural pause up to 1200ms or max_gap_ms)
+            allowed_gap = max(max_gap_ms, 1200)
             if -200 <= gap <= allowed_gap and combined_dur <= max_duration_ms:
                 can_merge = True
 

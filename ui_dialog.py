@@ -23,7 +23,8 @@ from .sub_parser import (
 )
 from .ffmpeg_worker import (
     is_ffmpeg_available, probe_embedded_subtitles,
-    extract_embedded_subtitle, BatchCutWorker, refresh_binary_paths
+    extract_embedded_subtitle, BatchCutWorker, refresh_binary_paths,
+    refine_timestamps_with_audio
 )
 from .ffmpeg_downloader import ensure_ffmpeg, FFmpegSetupDialog
 
@@ -306,17 +307,39 @@ class AnkiSubDialog(QDialog):
         self.combo_sub1_embedded.clear()
         self.combo_sub2_embedded.clear()
 
+        # Check for companion subtitle file in the same directory (e.g. .en.vtt, .vtt, .srt, .ass)
+        base_no_ext = os.path.splitext(video_path)[0]
+        video_dir = os.path.dirname(video_path)
+        companion_sub = None
+        candidates = [
+            f"{base_no_ext}.en.vtt",
+            f"{base_no_ext}.vtt",
+            f"{base_no_ext}.en.srt",
+            f"{base_no_ext}.srt",
+            f"{base_no_ext}.ass",
+            f"{base_no_ext}.ssa"
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                companion_sub = c
+                break
+
         if self.embedded_tracks:
             for t in self.embedded_tracks:
                 item_label = f"轨道 {t['sub_index'] + 1} [{t['lang']}] {t['title']} ({t['codec']})"
                 self.combo_sub1_embedded.addItem(item_label, t['sub_index'])
                 self.combo_sub2_embedded.addItem(item_label, t['sub_index'])
             
-            # Switch to embedded if external not specified
-            if not self.edit_sub1.text():
+            if companion_sub and not self.edit_sub1.text():
+                self.edit_sub1.setText(companion_sub)
+                self.combo_sub1_source.setCurrentIndex(0)
+            elif not self.edit_sub1.text():
                 self.combo_sub1_source.setCurrentIndex(1)
         else:
             self.combo_sub1_source.setCurrentIndex(0)
+            if companion_sub and not self.edit_sub1.text():
+                self.edit_sub1.setText(companion_sub)
+
 
     def _on_sub1_source_changed(self, idx: int):
         is_embedded = (idx == 1)
@@ -412,7 +435,11 @@ class AnkiSubDialog(QDialog):
                     max_duration_ms=self.cfg_merge_max_duration_ms
                 )
 
-            # 4. Secondary subtitles (Translation)
+            # 4. Refine timestamps with audio pauses to eliminate cutoffs and trailing words
+            self.lbl_stats.setText("正在校准音频边界，消除截断处拖音...")
+            primary_items = refine_timestamps_with_audio(video_path, primary_items)
+
+            # 5. Secondary subtitles (Translation)
             secondary_items = []
             if self.check_enable_sub2.isChecked():
                 secondary_items = self._get_sub_items(is_primary=False)
@@ -425,10 +452,10 @@ class AnkiSubDialog(QDialog):
                         max_duration_ms=self.cfg_merge_max_duration_ms
                     )
 
-            # 5. Align
+            # 6. Align
             self.parsed_items = align_bilingual_subtitles(primary_items, secondary_items)
 
-            # 6. Populate Table
+            # 7. Populate Table
             self._render_table()
 
         finally:
