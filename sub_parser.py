@@ -94,13 +94,19 @@ def is_sound_effect(text: str) -> bool:
     return False
 
 
-# Sentence terminators and common abbreviation whitelist to prevent false splits
+# Sentence terminators and common abbreviation whitelists to prevent false splits
 SENTENCE_TERMINATORS = ('.', '?', '!', '。', '？', '！', '…')
-ABBREVIATIONS = {
-    'mr', 'mrs', 'ms', 'dr', 'prof', 'vs', 'etc', 'eg', 'ie',
-    'vol', 'jr', 'sr', 'approx', 'dept', 'fig', 'inc', 'ltd', 'co', 'corp',
+# Title/prefix abbreviations: usually followed by a capitalized name or number (Dr. Smith, No. 1)
+TITLE_ABBREVIATIONS = {
+    'mr', 'mrs', 'ms', 'dr', 'prof', 'vs', 'vol', 'jr', 'sr', 'st',
+    'approx', 'dept', 'fig', 'no'
+}
+# Unit/phrase abbreviations: mid-sentence before lowercase, but can end a sentence before uppercase
+UNIT_ABBREVIATIONS = {
+    'etc', 'eg', 'ie', 'inc', 'ltd', 'co', 'corp',
     'a.m', 'p.m', 'e.g', 'i.e', 'u.s', 'u.k'
 }
+ABBREVIATIONS = TITLE_ABBREVIATIONS | UNIT_ABBREVIATIONS
 
 CAPITAL_SENTENCE_STARTERS = {
     'So', 'If', 'When', 'While', 'What', 'Why', 'How', 'Where',
@@ -113,7 +119,7 @@ CAPITAL_SENTENCE_STARTERS = {
 def is_word_sentence_end(word: str, next_word: str = "", cur_word_count: int = 1) -> bool:
     """
     Check if a word finishes a complete grammatical sentence.
-    Distinguishes abbreviations (Mr., Dr., 9:00 a.m. vs 6:00 p.m.?) and detects
+    Distinguishes abbreviations (Mr., Dr., 9:00 a.m. vs 11 a.m.. What...) and detects
     missing periods before capitalized sentence starters (e.g. YouTube censorship drops).
     """
     t = word.rstrip().rstrip('"\'”)』」')
@@ -121,17 +127,23 @@ def is_word_sentence_end(word: str, next_word: str = "", cur_word_count: int = 1
         return False
 
     if t.endswith(SENTENCE_TERMINATORS):
+        # Question/exclamation marks or double dots ("a.m..") always end a sentence
+        if t.endswith(('?', '!', '？', '！')) or (t.endswith('..') and not t.endswith('...')):
+            return True
+
         core = t.lower().rstrip('.?!。？！…')
-        # Check abbreviation whitelist
-        if core in ABBREVIATIONS:
-            # If ending with ? or !, it is still a true sentence terminator
-            if t.endswith(('?', '!', '？', '！')):
-                return True
-            # For dot abbreviations (a.m., etc.), only terminate if next_word is uppercase
+        # "No." or "St." followed by a digit is a number prefix, not a sentence end
+        if core in ('no', 'st') and next_word and next_word[:1].isdigit():
+            return False
+
+        if core in TITLE_ABBREVIATIONS:
+            return False
+
+        if core in UNIT_ABBREVIATIONS:
             if next_word:
                 nw_clean = next_word.lstrip('"\'“([（【')
-                if nw_clean and nw_clean[0].islower():
-                    return False
+                if nw_clean and nw_clean[0].isupper():
+                    return True
             return False
 
         # Multi-dot initialisms / abbreviations: e.g. a.m., p.m., u.s.
@@ -140,10 +152,6 @@ def is_word_sentence_end(word: str, next_word: str = "", cur_word_count: int = 1
                 nw_clean = next_word.lstrip('"\'“([（【')
                 if nw_clean and nw_clean[0].islower():
                     return False
-
-        # "No." or "St." followed by a digit is a number prefix, not a sentence end
-        if core in ('no', 'st') and next_word and next_word[0].isdigit():
-            return False
 
         return True
 
@@ -172,216 +180,145 @@ TIMESTAMP_RE = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Cue normalization
+# Turns raw subtitle cues into clean, non-overlapping, non-duplicated timed text
+# segments. These segments are the "atoms" consumed by the Anki card segmenter
+# (segment_for_anki). Parsing never merges or re-splits sentences by itself.
+# ---------------------------------------------------------------------------
+
+WORD_TS_RE = re.compile(r'<((?:\d{1,2}:)?\d{1,2}:\d{2}[.,]\d{3})>')
+
+
 def parse_vtt_word_level(raw_cues: List[Dict]) -> List[Dict]:
     """
-    Reconstruct exact, grammatically complete sentences from word-level VTT
-    (e.g. YouTube auto-captions and Whisper word-timestamped VTT).
-    Builds continuous word stream and cuts cleanly at sentence-ending punctuation.
+    YouTube auto-captions / word-timestamped VTT (<00:00:01.234><c> word</c>).
+    Returns one segment per newly spoken caption line. Each segment carries the
+    exact word timings in seg['words'] so the card segmenter can cut between words.
     """
-    words = []
+    segments = []
     for c in raw_cues:
         # Ignore 10ms-50ms flash transition cues
         if c['end_ms'] - c['start_ms'] <= 50:
             continue
-        tag_lines = [l for l in c['lines'] if '<' in l]
+        tag_lines = [l for l in c['lines'] if WORD_TS_RE.search(l) or '<c>' in l]
         if not tag_lines:
             continue
         line = tag_lines[-1]  # The newly spoken speech line
+        tokens = WORD_TS_RE.split(line)
+        words = []
 
-        # Tokenize by <HH:MM:SS.mmm>
-        tokens = re.split(r'<(\d{2}:\d{2}:\d{2}\.\d{3})>', line)
-        w0 = clean_text(tokens[0])
-        if w0:
-            t0 = c['start_ms']
-            t1 = time_to_ms(tokens[1]) if len(tokens) > 1 else c['end_ms']
-            words.append({'word': w0, 'start_ms': t0, 'end_ms': t1})
+        def add(text: str, t0: int, t1: int):
+            ws = clean_text(text).split()
+            if not ws:
+                return
+            step = max(0, t1 - t0) / len(ws)
+            for k, w in enumerate(ws):
+                words.append({
+                    'word': w,
+                    'start_ms': int(t0 + k * step),
+                    'end_ms': int(t0 + (k + 1) * step)
+                })
 
+        first_end = time_to_ms(tokens[1]) if len(tokens) > 1 else c['end_ms']
+        add(tokens[0], c['start_ms'], first_end)
         for k in range(1, len(tokens), 2):
             t_start = time_to_ms(tokens[k])
-            t_end = time_to_ms(tokens[k+2]) if k+2 < len(tokens) else c['end_ms']
-            w = clean_text(tokens[k+1])
-            if w:
-                words.append({'word': w, 'start_ms': t_start, 'end_ms': t_end})
-
-    if not words:
-        return []
-
-    sentences = []
-    cur_words = []
-    for idx, w in enumerate(words):
-        cur_words.append(w)
-        nxt_w = words[idx + 1]['word'] if idx + 1 < len(words) else ""
-        if is_word_sentence_end(w['word'], nxt_w, len(cur_words)):
-            s_text = " ".join(item['word'] for item in cur_words)
-            if s_text and s_text[0].islower():
-                s_text = s_text[0].upper() + s_text[1:]
-            s_start = cur_words[0]['start_ms']
-            s_end = cur_words[-1]['end_ms']
-            if s_start < s_end:
-                sentences.append({
-                    'start_ms': s_start,
-                    'end_ms': s_end,
-                    'text': s_text
-                })
-            cur_words = []
-
-    if cur_words:
-        s_text = " ".join(item['word'] for item in cur_words)
-        if s_text and s_text[0].islower():
-            s_text = s_text[0].upper() + s_text[1:]
-        s_start = cur_words[0]['start_ms']
-        s_end = cur_words[-1]['end_ms']
-        if s_start < s_end and s_text:
-            sentences.append({
-                'start_ms': s_start,
-                'end_ms': s_end,
-                'text': s_text
-            })
-
-    return sentences
-
-
-def reconstruct_sentences_from_cues(raw_cues: List[Dict], max_gap_ms: int = 1200) -> List[Dict]:
-    """
-    Reconstruct natural, grammatically complete sentences from cue-based subtitles
-    (e.g. YouTube 2-line roll-up VTT, Whisper segment VTT/SRT, and movie subtitles).
-    
-    1. Resolves overlapping screen-linger timestamps via the 2-Line Roll-Up Inversion Law.
-    2. Builds a continuous word-stream with syllable/character weights and inter-word pause allowances.
-    3. Splits cleanly at true sentence boundaries (Capital letter start -> terminal punctuation .?!).
-    """
-    if not raw_cues:
-        return []
-
-    # Step 1: De-overlap and recover line-level segments
-    line_segments = []
-    n_cues = len(raw_cues)
-    for i, c in enumerate(raw_cues):
-        s_ms = c['start_ms']
-        e_ms = c['end_ms']
-        # YouTube roll-up de-overlap: speech of cue i finishes when cue i+1 begins
-        if i + 1 < n_cues and raw_cues[i + 1]['start_ms'] > s_ms and e_ms > raw_cues[i + 1]['start_ms']:
-            true_end = raw_cues[i + 1]['start_ms']
-        else:
-            true_end = e_ms
-
-        raw_sub_lines = c.get('lines', [])
-        if not raw_sub_lines and 'text' in c:
-            raw_sub_lines = c['text'].split('\n')
-
-        cleaned_lines = [clean_text(x) for x in raw_sub_lines if clean_text(x)]
-        if not cleaned_lines or s_ms >= true_end:
-            continue
-
-        # 2-line roll-up timing recovery: previous cue's end_ms marks the exact boundary between line 0 and line 1
-        if len(cleaned_lines) == 2 and i > 0:
-            prev_orig_end = raw_cues[i - 1]['end_ms']
-            if s_ms + 100 < prev_orig_end < true_end - 100:
-                line_segments.append({'start_ms': s_ms, 'end_ms': prev_orig_end, 'text': cleaned_lines[0]})
-                line_segments.append({'start_ms': prev_orig_end, 'end_ms': true_end, 'text': cleaned_lines[1]})
-                continue
-
-        # Split across lines proportionally
-        total_chars = sum(max(1, len(x)) for x in cleaned_lines)
-        cur_t = float(s_ms)
-        dur = float(true_end - s_ms)
-        for l_text in cleaned_lines:
-            l_dur = dur * (max(1, len(l_text)) / total_chars)
-            line_segments.append({
-                'start_ms': int(round(cur_t)),
-                'end_ms': int(round(cur_t + l_dur)),
-                'text': l_text
-            })
-            cur_t += l_dur
-
-    if not line_segments:
-        return []
-
-    # Step 2: Build timed word stream
-    words = []
-    for seg in line_segments:
-        # Use regex to handle both whitespace-delimited words and CJK punctuation boundaries
-        raw_words = re.findall(r'[^\s。？！…]+[。？！…]*', seg['text'])
-        if not raw_words:
-            continue
-        s_ms, e_ms = seg['start_ms'], seg['end_ms']
-        dur = max(1, e_ms - s_ms)
-        spoken_weights, pause_weights = [], []
-        n_w = len(raw_words)
-        for idx, w in enumerate(raw_words):
-            alnum = sum(1 for ch in w if ch.isalnum())
-            spoken_weights.append(max(2.0, float(alnum)))
-            nxt = raw_words[idx + 1] if idx + 1 < n_w else ""
-            if idx < n_w - 1:
-                if is_word_sentence_end(w, nxt, idx + 1):
-                    pause_weights.append(4.5)
-                elif w.endswith((',', ';', ':', '—', '，', '；', '：')):
-                    pause_weights.append(2.0)
-                else:
-                    pause_weights.append(0.0)
+            if k + 2 < len(tokens):
+                t_end = time_to_ms(tokens[k + 2])
             else:
-                pause_weights.append(0.0)
+                # Last word in a YouTube rolling cue: c['end_ms'] includes any silence
+                # before the next cue, so cap the word's spoken duration to expose pauses.
+                n_w = max(1, len(clean_text(tokens[k + 1]).split()))
+                t_end = min(c['end_ms'], t_start + 500 * n_w)
+            add(tokens[k + 1], t_start, t_end)
 
-        total_w = sum(spoken_weights) + sum(pause_weights)
-        cur_t = float(s_ms)
-        for idx, w in enumerate(raw_words):
-            w_dur = dur * (spoken_weights[idx] / total_w)
-            p_dur = dur * (pause_weights[idx] / total_w)
-            words.append({
-                'word': w,
-                'start_ms': int(round(cur_t)),
-                'end_ms': int(round(cur_t + w_dur)),
-                'is_seg_end': (idx == n_w - 1)
+        if words:
+            segments.append({
+                'start_ms': words[0]['start_ms'],
+                'end_ms': words[-1]['end_ms'],
+                'text': ' '.join(w['word'] for w in words),
+                'words': words
             })
-            cur_t += w_dur + p_dur
 
-    # Step 3: Group words into complete sentences
-    sentences = []
-    cur = []
-    prev_w_end = 0
+    # De-overlap consecutive lines (screen linger)
+    for a, b in zip(segments, segments[1:]):
+        if a['start_ms'] < b['start_ms'] < a['end_ms']:
+            a['end_ms'] = b['start_ms']
+            lw = a['words'][-1]
+            lw['end_ms'] = max(lw['start_ms'] + 1, min(lw['end_ms'], b['start_ms']))
+    return segments
 
-    for idx, w in enumerate(words):
-        # Flush if gap between dialogue segments is large (scene change > max_gap_ms)
-        if cur and prev_w_end > 0 and (w['start_ms'] - prev_w_end > max(max_gap_ms, 1200)):
-            txt = ' '.join(x['word'] for x in cur)
-            if txt and txt[0].islower():
-                txt = txt[0].upper() + txt[1:]
-            sentences.append({
-                'start_ms': cur[0]['start_ms'],
-                'end_ms': cur[-1]['end_ms'],
-                'text': txt,
-                'mid_cue_end': not cur[-1].get('is_seg_end', True)
-            })
-            cur = []
 
-        cur.append(w)
-        prev_w_end = w['end_ms']
-        nxt_w = words[idx + 1]['word'] if idx + 1 < len(words) else ""
+def normalize_cues(raw_cues: List[Dict]) -> List[Dict]:
+    """
+    Clean cue-based subtitles (SRT / VTT / roll-up captions) into timed line segments.
 
-        if is_word_sentence_end(w['word'], nxt_w, len(cur)):
-            txt = ' '.join(x['word'] for x in cur)
-            if txt and txt[0].islower():
-                txt = txt[0].upper() + txt[1:]
-            sentences.append({
-                'start_ms': cur[0]['start_ms'],
-                'end_ms': cur[-1]['end_ms'],
-                'text': txt,
-                'mid_cue_end': not cur[-1].get('is_seg_end', True)
-            })
-            cur = []
+    - Removes screen-linger overlap (a line's speech ends when the next cue starts).
+    - Removes roll-up / growing-caption duplicates (repeated first line or prefix).
+    - Keeps every display line as its own segment ('cue' marks lines of one cue),
+      so dialogue dashes and line breaks remain usable as boundary hints.
+    """
+    segs: List[Dict] = []
+    n = len(raw_cues)
+    prev_full = None
+    prev_last_line = None
 
-    if cur:
-        txt = ' '.join(x['word'] for x in cur)
-        if txt and txt[0].islower():
-            txt = txt[0].upper() + txt[1:]
-        sentences.append({
-            'start_ms': cur[0]['start_ms'],
-            'end_ms': cur[-1]['end_ms'],
-            'text': txt,
-            'mid_cue_end': False
-        })
+    for i, c in enumerate(raw_cues):
+        s_ms, e_ms = c['start_ms'], c['end_ms']
+        if i + 1 < n:
+            nxt_start = raw_cues[i + 1]['start_ms']
+            if s_ms < nxt_start < e_ms:
+                e_ms = nxt_start
 
-    return sentences
+        raw_lines = c.get('lines')
+        if raw_lines is None:
+            raw_lines = str(c.get('text', '')).split('\n')
+        lines = [t for t in (clean_text(x) for x in raw_lines) if t]
+        if not lines or s_ms >= e_ms:
+            continue
+        full = ' '.join(lines)
+
+        # Identical text repeated by consecutive cues -> extend previous segment
+        if full == prev_full and segs and s_ms - segs[-1]['end_ms'] <= 300:
+            segs[-1]['end_ms'] = max(segs[-1]['end_ms'], e_ms)
+            continue
+
+        orig_lines = lines
+        if prev_full and len(full) > len(prev_full) and full.startswith(prev_full):
+            # Growing caption: "A" -> "A B" -> "A B C"; only the new words are new speech
+            rest = full[len(prev_full):].strip()
+            lines = [rest] if rest else []
+        elif prev_last_line and len(lines) >= 2 and lines[0] == prev_last_line:
+            # Roll-up caption: first line repeats the previous cue's last line
+            lines = lines[1:]
+        prev_full = full
+        prev_last_line = orig_lines[-1]
+        if not lines:
+            continue
+
+        if segs and s_ms < segs[-1]['end_ms']:
+            segs[-1]['end_ms'] = max(segs[-1]['start_ms'] + 1, s_ms)
+
+        parts = []
+        prev_orig_end = raw_cues[i - 1]['end_ms'] if i > 0 else None
+        if len(lines) == 2 and prev_orig_end is not None and s_ms + 100 < prev_orig_end < e_ms - 100:
+            # 2-line roll-up timing law: the previous cue's original end time marks the
+            # moment the second line starts being spoken.
+            parts = [(s_ms, prev_orig_end, lines[0]), (prev_orig_end, e_ms, lines[1])]
+        else:
+            total = sum(max(1, len(x)) for x in lines)
+            cur = float(s_ms)
+            for x in lines:
+                d = (e_ms - s_ms) * max(1, len(x)) / total
+                parts.append((int(round(cur)), int(round(cur + d)), x))
+                cur += d
+
+        for a, b, t in parts:
+            if b > a:
+                segs.append({'start_ms': a, 'end_ms': b, 'text': t, 'cue': i})
+
+    return segs
 
 
 def parse_vtt(content: str) -> List[Dict]:
@@ -471,42 +408,19 @@ def parse_vtt(content: str) -> List[Dict]:
     if not raw_cues:
         return []
 
-    # Check if this is a YouTube auto-caption rolling VTT (contains <c> or <HH:MM:SS.mmm> word timestamps)
+    # YouTube auto-caption rolling VTT (contains <c> or <HH:MM:SS.mmm> word timestamps)
     is_yt_rolling = any(
-        any('<c>' in l or re.search(r'<\d{2}:\d{2}', l) for l in c['lines'])
+        any('<c>' in l or WORD_TS_RE.search(l) for l in c['lines'])
         for c in raw_cues
     )
-
     if is_yt_rolling:
-        sentences = parse_vtt_word_level(raw_cues)
-        if sentences:
-            return sentences
+        segments = parse_vtt_word_level(raw_cues)
+        if segments:
+            return segments
 
-    # Reconstruct complete grammatical sentences from roll-up / line-wrapped cues
-    sentences = reconstruct_sentences_from_cues(raw_cues)
-    if sentences:
-        return sentences
-
-    # Fallback / standard VTT
-    items = []
-    prev_text = ""
-    for c in raw_cues:
-        text = clean_text(' '.join(c['lines']))
-        if not text or c['start_ms'] >= c['end_ms']:
-            continue
-            
-        if text == prev_text:
-            continue
-            
-        items.append({
-            'start_ms': c['start_ms'],
-            'end_ms': c['end_ms'],
-            'text': text
-        })
-        prev_text = text
-
-    return items
-
+    # Cue-based subtitles: clean, de-overlapped, de-duplicated line segments.
+    # Sentence building / card sizing happens later in segment_for_anki().
+    return normalize_cues(raw_cues)
 
 
 def parse_srt(content: str) -> List[Dict]:
@@ -629,81 +543,571 @@ def join_subtitle_texts(t1: str, t2: str) -> str:
     return f"{t1} {t2}"
 
 
+# ---------------------------------------------------------------------------
+# Anki card segmentation
+#
+# Goal: every card = one complete, self-contained utterance of a comfortable
+# length for listening practice (about 2.5 - 8 s).
+#
+# Method: the subtitle stream is tokenized (words for spaced languages, phrase
+# chunks for Chinese/Japanese). Every gap between two tokens is a candidate cut
+# with a "cut cost" derived from punctuation, real silence between subtitle
+# lines, dialogue dashes, capitalized sentence starters and language-specific
+# hints (dangling English function words, Chinese sentence-final particles and
+# discourse markers). A dynamic program then picks the globally cheapest set of
+# cuts, where each card also pays a length cost (too short / too long) and pays
+# for every good boundary it swallows. Result:
+#   * complete sentences stay whole and are normally one per card;
+#   * very short sentences ("Most people do.") join a neighbouring sentence;
+#   * over-long sentences are split at the best clause boundary (comma, pause);
+#   * unpunctuated subtitles (e.g. Chinese ASR subtitles) are grouped by pauses
+#     and particles instead of collapsing into one giant block.
+# ---------------------------------------------------------------------------
+
+_CJK_CHAR_RE = re.compile(r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]')
+_HANGUL_RE = re.compile(r'[\uac00-\ud7af\u1100-\u11ff\u3130-\u318f]')
+_CJK_SPLIT_RE = re.compile(
+    r'[^，,。？！?!；;：:、…]+[，,。？！?!；;：:、…]*[」』”’）)】》]*|[，,。？！?!；;：:、…]+[」』”’）)】》]*'
+)
+_TERMINAL_CHARS = '.?!。？！…‼⁇'
+_CLAUSE_CHARS = ';:；：—–'
+_COMMA_CHARS = ',，、'
+_CLOSING_CHARS = '"\'”’)）]】」』》'
+_OPENING_CHARS = '"\'“‘(（[【「『《¿¡'
+_FULLWIDTH_END = '，。？！、：；」』）】》…'
+
+_EN_DANGLING = {
+    'the', 'a', 'an', 'to', 'of', 'and', 'or', 'but', 'nor', 'in', 'on', 'at', 'for',
+    'with', 'from', 'by', 'into', 'onto', 'about', 'my', 'your', 'his', 'her', 'its',
+    'our', 'their', 'is', 'are', 'was', 'were', 'am', 'be', 'been', 'very', 'than',
+    'because', 'if', 'as', 'i', 'we', 'they', 'he', 'she', "i'm", "you're", "we're",
+    "they're", "i've", "i'll", "i'd", 'can', 'will', 'would', 'should', 'could',
+    'must', 'whose', 'such', 'every', 'each', 'some', 'any', 'no', 'not', 'more',
+    'most', 'less', 'kind', 'sort', 'lot', 'going', 'gonna', 'wanna', 'gotta'
+}
+_EN_INCOMPLETE_END = _EN_DANGLING - {'be', 'been', 'more', 'most', 'less', 'lot', 'some', 'any', 'no', 'not'}
+_EN_CONJ_START = {
+    'and', 'but', 'so', 'because', 'which', 'who', 'when', 'where', 'while', 'if',
+    'then', 'or', 'although', 'though', 'since', 'unless', 'until', 'whereas', 'whether'
+}
+_EN_FINITE_VERBS = {
+    'came', 'comes', 'went', 'goes', 'was', 'were', 'is', 'are', 'had', 'has', 'have',
+    'made', 'makes', 'took', 'takes', 'did', 'does', 'felt', 'feels', 'happened', 'happens',
+    'started', 'starts', 'ended', 'ends', 'led', 'leads', 'worked', 'works', 'became',
+    'becomes', 'seemed', 'seems', 'got', 'gets', 'gave', 'gives', 'kept', 'keeps', 'left',
+    'leaves', 'brought', 'brings', 'course', 'means', 'meant', 'helps', 'helped',
+    'requires', 'allows', 'creates', 'causes', 'changed', 'changes', 'mattered', 'matters'
+}
+_EN_PARTICIPLE_CONT = {
+    'knowing', 'responding', 'meaning', 'including', 'assuming', 'depending', 'according',
+    'compared', 'based', 'resulting', 'leading', 'trying', 'hoping', 'wondering',
+    'thinking', 'feeling', 'looking', 'using', 'having', 'being'
+}
+_EN_CLAUSE_SUBJECTS = {
+    'i', 'you', 'we', 'they', 'he', 'she', 'it', 'there', 'the', 'a', 'an', 'this',
+    'that', 'these', 'those', 'my', 'your', 'his', 'her', 'our', 'their', 'most',
+    'many', 'some', 'all', 'people', 'everyone', 'anyone', 'no', 'one', 'what', 'who'
+}
+_EN_EXTRA_STARTERS = {
+    'And', 'Because', 'Then', 'Well', 'Okay', 'OK', 'Yeah', 'Oh', 'Yes', 'No',
+    'Look', 'Anyway', 'Also', 'Or', 'Like', 'Just', 'Right', 'Maybe', 'Actually',
+    'Basically', 'Again', 'First', 'Second', 'Third', 'Finally', 'Plus', 'Instead',
+    'Otherwise', 'However', 'Meanwhile', 'Still', 'Even', 'Hey', 'Hi', 'Hello',
+    'Thanks', 'Please', 'Sorry', 'Wait', 'Listen', 'Remember', 'Imagine', 'Think'
+}
+_ZH_END_STRONG = set('啊嗯吧吗呀哦哈啦嘛呗哎噢喔哇嘞咯呐')
+_ZH_END_WEAK = {'了': 0.7, '呢': 0.3}
+_ZH_DISCOURSE_START = (
+    '那么', '那我们', '那这个', '那', '所以', '因为', '但是', '可是', '不过', '然后',
+    '我们来', '我们再', '我们看', '首先', '其次', '另外', '而且', '比如', '例如',
+    '接下来', '最后', '如果', '其实', '嗯', '啊', '哎', '下面', '总之', '当然',
+    '好的', '好了', '好我们', '是的', '没错', '还有', '同时', '于是', '后来'
+)
+_ZH_CONT_END = (
+    '是', '和', '与', '在', '把', '被', '跟', '给', '对', '从', '向', '让', '这', '那',
+    '个', '一', '能', '就', '要', '会', '很', '都', '也', '还', '到', '不', '没', '最',
+    '非常', '比较', '因为', '所以', '如果', '但是', '然后', '而且', '就是', '能够',
+    '可以', '我们', '你们', '他们', '这个', '那个', '一个', '叫做', '通过', '什么是'
+)
+_ZH_CONT_START = ('的', '吗', '呢', '吧', '们')
+# Unpunctuated Chinese line: allow a cut after a sentence-final particle that is
+# directly followed by a discourse marker, e.g. "列举出来了啊|所以呢这本书呢".
+_ZH_INNER_SPLIT_RE = re.compile(
+    r'(?<=[啊嗯吧嘛呀哦啦])(?=那么|那我们|所以|但是|可是|不过|然后|因为|如果|其实|'
+    r'我们来|我们再|我们看|接下来|首先|另外|而且|比如)'
+)
+
+_INF = 1e9
+
+
+def _is_cjk_text(t: str) -> bool:
+    return bool(_CJK_CHAR_RE.search(t))
+
+
+def _token_weight(t: str) -> float:
+    cjk = len(_CJK_CHAR_RE.findall(t))
+    hg = len(_HANGUL_RE.findall(t))
+    lat = sum(1 for ch in t if ch.isalnum()) - cjk - hg
+    return max(1.5, lat + 2.5 * (cjk + hg))
+
+
+def _token_units(t: str) -> Tuple[int, int]:
+    """Returns (display units, cjk units): CJK chars count individually, other words count 1."""
+    cjk = len(_CJK_CHAR_RE.findall(t))
+    rest = _CJK_CHAR_RE.sub(' ', t)
+    other = 1 if any(ch.isalnum() for ch in rest) else 0
+    return cjk + other, cjk
+
+
+def _split_pieces(text: str) -> List[Tuple[str, str]]:
+    """Split one subtitle line into (token, glue_before) pieces."""
+    pieces: List[Tuple[str, str]] = []
+    for ci, chunk in enumerate(text.split()):
+        glue = ' ' if ci else ''
+        if _is_cjk_text(chunk):
+            subs = []
+            for sub in (_CJK_SPLIT_RE.findall(chunk) or [chunk]):
+                subs.extend(x for x in _ZH_INNER_SPLIT_RE.split(sub) if x)
+            for k, sub in enumerate(subs):
+                if k > 0 and pieces and not any(ch.isalnum() for ch in sub):
+                    pieces[-1] = (pieces[-1][0] + sub, pieces[-1][1])
+                    continue
+                pieces.append((sub, glue if k == 0 else ''))
+        else:
+            pieces.append((chunk, glue))
+    return pieces
+
+
+def _tokenize_segments(segments: List[Dict]) -> List[Dict]:
+    toks: List[Dict] = []
+    for si, seg in enumerate(segments):
+        s_ms, e_ms = int(seg['start_ms']), int(seg['end_ms'])
+        cue = seg.get('cue', si)
+        words = seg.get('words')
+        if words:
+            for k, w in enumerate(words):
+                toks.append({
+                    'text': w['word'], 'glue': ' ' if k else '',
+                    'start': int(w['start_ms']), 'end': int(w['end_ms']),
+                    'seg': si, 'cue': cue, 'cjk': _is_cjk_text(w['word']),
+                    'timed': True
+                })
+            continue
+
+        pieces = _split_pieces(seg['text'])
+        if not pieces:
+            continue
+        spoken, pauses = [], []
+        for k, (p, _) in enumerate(pieces):
+            spoken.append(_token_weight(p))
+            last = p.rstrip(_CLOSING_CHARS)[-1:]
+            if k == len(pieces) - 1:
+                pauses.append(0.0)
+            elif last and last in _TERMINAL_CHARS:
+                pauses.append(3.0)
+            elif last and (last in _COMMA_CHARS or last in _CLAUSE_CHARS):
+                pauses.append(1.5)
+            else:
+                pauses.append(0.0)
+        total = sum(spoken) + sum(pauses)
+        dur = max(1, e_ms - s_ms)
+        cur = float(s_ms)
+        for k, (p, glue) in enumerate(pieces):
+            w_d = dur * spoken[k] / total
+            toks.append({
+                'text': p, 'glue': glue,
+                'start': int(round(cur)),
+                'end': e_ms if k == len(pieces) - 1 else int(round(cur + w_d)),
+                'seg': si, 'cue': cue, 'cjk': _is_cjk_text(p), 'timed': False
+            })
+            cur += w_d + dur * pauses[k] / total
+    return toks
+
+
+def _clean_word(t: str) -> str:
+    return re.sub(r"[^\w']", '', t.lower())
+
+
+def _is_false_en_period(toks: List[Dict], b: int, gap: int) -> bool:
+    """
+    Detect ASR false mid-sentence periods/question marks where a single sentence
+    was split across two capitalized clauses or fragments.
+    """
+    n = len(toks)
+    a, tb_tok = toks[b], toks[b + 1]
+    aw = _clean_word(a['text'])
+    prev_aw = _clean_word(toks[b - 1]['text']) if b > 0 else ''
+    nw = _clean_word(tb_tok['text'])
+    nw2 = _clean_word(toks[b + 2]['text']) if b + 2 < n else ''
+
+    # 1. Left side is syntactically incomplete ("to.", "to be. At this point", "and it was. The best...")
+    if aw in _EN_INCOMPLETE_END:
+        return True
+    if prev_aw == 'to' and aw == 'be' and nw in {'at', 'in', 'on', 'with', 'for', 'from', 'by', 'a', 'an', 'the'}:
+        return True
+    if prev_aw in {"i'm", 'you', 'we', 'they', 'he', 'she', 'it'} and aw in {'just', 'only', 'also', 'still', 'even'}:
+        return True
+    if prev_aw in {'it', 'that', 'this', 'there'} and aw in {'was', 'is'} and b >= 2:
+        prev2 = _clean_word(toks[b - 2]['text'])
+        if prev2 in {'and', 'but', 'so', 'because', 'that'}:
+            return True
+
+    # 2. Incomplete question + 1-word completion ("What opportunities? Close.", "in the right? Question.", "enemy? Name?")
+    if prev_aw == 'what' and nw in {'close', 'open', 'happen', 'happens', 'change', 'changes', 'matter', 'matters', 'work', 'works'}:
+        return True
+    if prev_aw == 'the' and aw in {'right', 'wrong', 'same', 'only', 'actual', 'main', 'first', 'next', 'last'} and nw in {'question', 'answer', 'thing', 'way', 'place', 'time', 'person', 'direction', 'one'}:
+        return True
+    if aw == 'enemy' and nw == 'name':
+        return True
+
+    if gap >= 800:
+        return False
+
+    # 3. Right side opens with a subordinate / participial / prepositional continuation
+    if nw in _EN_PARTICIPLE_CONT and nw2 not in _EN_FINITE_VERBS:
+        return True
+    if nw == 'while' and nw2 and nw2 not in _EN_CLAUSE_SUBJECTS:
+        return True
+    if nw == 'out' and nw2 == 'of':
+        return True
+    if nw == 'at' and nw2 in {'this', 'that', 'the', 'a', 'an', 'least', 'most', 'first', 'last', 'all', 'once'}:
+        return True
+    if nw == 'after' and nw2 in {'this', 'that', 'a', 'an', 'the', 'all'}:
+        # Short prepositional phrase ("After this buildup of tension or disease.")
+        k = b + 1
+        clause_w = 0
+        has_comma = False
+        while k < n and clause_w <= 9:
+            clause_w += 1
+            if any(ch in _COMMA_CHARS for ch in toks[k]['text']):
+                has_comma = True
+            if any(ch in _TERMINAL_CHARS for ch in toks[k]['text']):
+                break
+            k += 1
+        if clause_w <= 8 and not has_comma:
+            return True
+    if nw in {'always', 'never', 'often', 'usually', 'sometimes', 'rarely', 'already'} and nw2 in _EN_FINITE_VERBS:
+        return True
+    if nw in {'today', 'tomorrow', 'yesterday', 'tonight', 'now', 'here', 'there'} and nw2 in {'and', 'or', 'but'}:
+        return True
+    if nw == 'that' and nw2 in _EN_FINITE_VERBS:
+        return True
+    if aw in {'everyone', 'everybody', 'someone', 'somebody', 'anyone', 'anybody', 'everything', 'something', 'anything', 'nothing', 'people', 'person', 'things', 'time', 'place', 'way'}:
+        if nw in {'you', 'i', 'we', 'they', 'he', 'she'} and nw2 in {'told', 'said', 'know', 'knew', 'think', 'thought', 'want', 'wanted', 'need', 'needed', 'love', 'loved', 'hate', 'hated', 'met', 'saw', 'asked', 'called', 'gave', 'made', 'had', 'have', 'did', 'do', 'used', 'chose'}:
+            return True
+
+    return False
+
+
+def _boundary_cost(toks: List[Dict], b: int, punctuated: bool = True) -> Tuple[float, bool]:
+    """
+    Cost of cutting between toks[b] and toks[b+1] (0 = perfect sentence boundary).
+    punctuated=False means the whole track has (almost) no punctuation, e.g.
+    YouTube auto-captions or Chinese ASR subtitles: pauses and lexical hints decide.
+    """
+    a, b_tok = toks[b], toks[b + 1]
+    ta, tb = a['text'], b_tok['text']
+    same_seg = a['seg'] == b_tok['seg']
+    same_cue = a['cue'] == b_tok['cue']
+    real_gap = (not same_seg) or (a['timed'] and b_tok['timed'])
+    gap = b_tok['start'] - a['end'] if real_gap else 0
+    cjk = a['cjk'] or b_tok['cjk']
+
+    core = ta.rstrip(_CLOSING_CHARS)
+    last = core[-1:]
+    nb = tb.lstrip(_OPENING_CHARS)
+    nb0 = nb[:1]
+    next_is_lower = bool(nb0) and (('a' <= nb0 <= 'z') or nb0.isdigit())
+
+    is_sentence = False
+    has_punct = True
+    if last and last in _TERMINAL_CHARS:
+        if cjk and last in '。？！?!…':
+            c, is_sentence = 0.0, True
+        elif is_word_sentence_end(ta, tb, 1) and not (next_is_lower and last in '.…'):
+            if not cjk and _is_false_en_period(toks, b, gap):
+                c, is_sentence = 4.8, False
+            else:
+                # Slight tie-break preference for cue boundaries / real pauses over mid-cue splits
+                c = 0.25 if same_seg else (0.0 if gap >= 150 else 0.1)
+                is_sentence = True
+        else:
+            c = 3.5   # abbreviation / ellipsis continuing in lowercase
+    elif last and last in _CLAUSE_CHARS:
+        c = 1.8
+    elif last and last in _COMMA_CHARS:
+        c = 2.8
+    else:
+        has_punct = False
+        if cjk:
+            if not same_seg or not b_tok['glue']:
+                c = 3.5                        # line boundary / particle+marker split point
+            else:
+                c = 2.8                        # a space inside a CJK line works like a comma
+        elif not punctuated:
+            c = 5.5 if (same_seg and not a['timed']) else 4.0   # unpunctuated captions: pauses decide
+        elif a['timed'] and b_tok['timed']:
+            c = 5.0
+        else:
+            c = 9.0 if same_seg else (5.5 if same_cue else 5.0)
+
+    # Dialogue dash at the start of a new line: "- Hi." / "- Hello."
+    if not same_seg and tb[:1] in '-–—':
+        c = min(c, 0.8)
+        is_sentence = True
+
+    # Capitalized sentence starter right after an unpunctuated word
+    if not has_punct and not cjk and not tb.isupper():
+        w_next = nb.rstrip(',.:;?!')
+        if w_next in CAPITAL_SENTENCE_STARTERS or w_next in _EN_EXTRA_STARTERS:
+            c = min(c, 2.5)
+        elif not punctuated:
+            # all-lowercase auto captions: "so", "now", "okay", "but" often open a sentence
+            w_cap = w_next[:1].upper() + w_next[1:]
+            if w_cap in CAPITAL_SENTENCE_STARTERS or w_cap in _EN_EXTRA_STARTERS:
+                c -= 0.8
+
+    # Real silence between subtitle lines / words
+    if not is_sentence:
+        if gap >= 1500:
+            c -= 3.0
+            if not punctuated:
+                is_sentence = True
+        elif gap >= 700:
+            c -= 2.2
+        elif gap >= 300:
+            c -= 1.3
+        elif gap >= 120:
+            c -= 0.6
+
+    if not is_sentence:
+        if cjk:
+            if not has_punct:
+                tail = core[-1:]
+                if tail in _ZH_END_STRONG:
+                    c -= 1.2
+                elif tail in _ZH_END_WEAK:
+                    c -= _ZH_END_WEAK[tail]
+                elif core.endswith('的'):
+                    c += 1.0
+                elif core.endswith(_ZH_CONT_END):
+                    c += 1.5
+                if nb.startswith(_ZH_CONT_START):
+                    c += 2.5
+                elif nb.startswith(_ZH_DISCOURSE_START):
+                    c -= 1.2
+        else:
+            aw = _clean_word(core)
+            if aw in _EN_DANGLING:
+                c += 3.0
+            nw = _clean_word(nb)
+            if has_punct:
+                # Never split right before a 1-2 word tag question (", right?", ", you know?", ", isn't it?")
+                if last in _COMMA_CHARS:
+                    b2_text = toks[b + 2]['text'] if b + 2 < len(toks) else ''
+                    if tb.rstrip(_CLOSING_CHARS).endswith('?') or (
+                        b2_text.rstrip(_CLOSING_CHARS).endswith('?') and b + 2 < len(toks) and toks[b + 2]['seg'] == b_tok['seg']
+                    ):
+                        c += 4.0
+                # Comma/semicolon + conjunction (", but", ", so", ", which", ", because") is a clean clause break
+                if nw in _EN_CONJ_START:
+                    c -= 0.9
+            else:
+                if punctuated and next_is_lower:
+                    c += 1.0
+                    if nw in _EN_CONJ_START:
+                        c -= 2.2
+                elif nw in _EN_CONJ_START:
+                    c -= 1.2
+
+    return max(0.0, c), is_sentence
+
+
+def _join_tokens(toks: List[Dict], starts_sentence: bool = True) -> str:
+    out = ''
+    for k, t in enumerate(toks):
+        if k == 0:
+            out = t['text']
+            continue
+        if t['seg'] == toks[k - 1]['seg']:
+            glue = t['glue']
+        else:
+            glue = '' if out[-1:] in _FULLWIDTH_END else ' '
+        out += glue + t['text']
+    out = out.strip()
+    # Capitalize only real sentence starts, never a clause continued from the previous card
+    if starts_sentence and out[:1].isascii() and out[:1].islower():
+        out = out[0].upper() + out[1:]
+    return out
+
+
+def segment_for_anki(
+    segments: List[Dict],
+    max_duration_ms: int = 15000,
+    ideal_min_ms: int = 2800,
+    ideal_max_ms: Optional[int] = None,
+    hard_gap_ms: int = 2500
+) -> List[Dict]:
+    """
+    Re-segment normalized subtitle lines into Anki-friendly cards.
+    Returns [{'start_ms', 'end_ms', 'text'}] sorted by time.
+    """
+    toks = _tokenize_segments([s for s in segments if s.get('text', '').strip()])
+    n = len(toks)
+    if n == 0:
+        return []
+
+    hard_max = max(4000, int(max_duration_ms or 15000))
+    hi = (ideal_max_ms or min(8500, max(5000, int(hard_max * 0.50)))) / 1000.0
+    lo = min(ideal_min_ms / 1000.0, hi / 2.0)
+
+    # Boundary costs: cut[b] between toks[b] and toks[b+1]
+    cut = [0.0] * max(0, n - 1)
+    keep = [0.0] * max(0, n - 1)     # penalty for swallowing boundary b inside a card
+    hard = [False] * max(0, n - 1)
+    sent = [False] * max(0, n - 1)
+    # Does this track use punctuation at all? (YouTube auto-captions / ASR often do not)
+    seg_ids = {t['seg'] for t in toks}
+    punct_segs = {t['seg'] for t in toks if any(ch in _TERMINAL_CHARS + _COMMA_CHARS for ch in t['text'])}
+    punctuated = len(punct_segs) >= 0.15 * max(1, len(seg_ids))
+    alpha, thresh = 0.375, 4.0
+    for b in range(n - 1):
+        c, sent[b] = _boundary_cost(toks, b, punctuated)
+        cut[b] = c
+        keep[b] = alpha * max(0.0, thresh - c)
+        if toks[b]['seg'] != toks[b + 1]['seg'] and toks[b + 1]['start'] - toks[b]['end'] > hard_gap_ms:
+            hard[b] = True
+
+    # Short introductory headings/prompts ("Vision.", "Daily levers.", "Constraints?", "At 7:30 p.m.?")
+    # should attach forward to the sentence/question they introduce rather than backward.
+    _QUESTION_OPENERS = {
+        'what', "what's", 'why', 'how', 'when', 'where', 'who', 'which',
+        'am', 'is', 'are', 'do', 'does', 'did', 'can', 'could', 'would', 'should', 'if'
+    }
+    sent_starts = [0] + [b + 1 for b in range(n - 1) if sent[b]]
+    sent_ends = [b for b in range(n - 1) if sent[b]] + [n - 1]
+    for s_idx, e_idx in zip(sent_starts, sent_ends):
+        s_len = e_idx - s_idx + 1
+        if e_idx < n - 1 and s_len <= 5 and not toks[s_idx]['cjk']:
+            w0 = _clean_word(toks[s_idx]['text'])
+            w1 = _clean_word(toks[s_idx + 1]['text']) if s_idx + 1 <= e_idx else ''
+            next_w0 = _clean_word(toks[e_idx + 1]['text'])
+            is_time_or_step = (w0 == 'at' and w1[:1].isdigit()) or (s_len <= 3 and w0 in {
+                'first', 'second', 'third', 'finally', 'step', 'number', 'question', 'point', "let's"
+            })
+            is_heading_before_q = s_len <= 3 and next_w0 in _QUESTION_OPENERS and not (
+                w0 in {'you', 'most', 'so', 'and', 'but', 'yet'} and w1 in {'think', 'know', 'people', 'to'}
+            )
+            if is_time_or_step or is_heading_before_q:
+                keep[e_idx] = 0.0
+                if s_idx > 0:
+                    keep[s_idx - 1] = max(keep[s_idx - 1], 2.0)
+
+    keep_pref = [0.0] * n
+    for b in range(n - 1):
+        keep_pref[b + 1] = keep_pref[b] + keep[b]
+    units_pref = [0] * (n + 1)
+    cjk_pref = [0] * (n + 1)
+    for k, t in enumerate(toks):
+        u, cu = _token_units(t['text'])
+        units_pref[k + 1] = units_pref[k] + u
+        cjk_pref[k + 1] = cjk_pref[k] + cu
+
+    def length_cost(i: int, j: int) -> float:
+        d = (toks[j]['end'] - toks[i]['start']) / 1000.0
+        cost = 0.0
+        if d < lo:
+            cost += 1.85 * (lo - d) ** 2
+        elif d > hi:
+            cost += 0.55 * (d - hi) ** 2
+        units = units_pref[j + 1] - units_pref[i]
+        cjk_units = cjk_pref[j + 1] - cjk_pref[i]
+        if cjk_units * 2 > units:
+            if units > 28:
+                cost += 0.02 * (units - 28) ** 2
+            if units <= 4:
+                cost += 1.2
+        else:
+            if units > 25:
+                cost += 0.02 * (units - 25) ** 2
+            if units <= 2:
+                cost += 1.2
+            elif units == 3:
+                cost += 0.4
+        return cost
+
+    best = [_INF] * (n + 1)
+    back = [0] * (n + 1)
+    best[0] = 0.0
+    for j in range(n):
+        for i in range(j, max(-1, j - 400), -1):
+            if i < j:
+                if hard[i]:
+                    break
+                if toks[j]['end'] - toks[i]['start'] > hard_max:
+                    break
+            if best[i] >= _INF:
+                continue
+            cost = (best[i] + length_cost(i, j) + (keep_pref[j] - keep_pref[i]) +
+                    (cut[i - 1] if i > 0 else 0.0))
+            if cost < best[j + 1]:
+                best[j + 1] = cost
+                back[j + 1] = i
+
+    bounds = []
+    j = n
+    while j > 0:
+        i = back[j]
+        bounds.append((i, j - 1))
+        j = i
+    bounds.reverse()
+
+    cards = []
+    for i, j in bounds:
+        text = _join_tokens(toks[i:j + 1], starts_sentence=(i == 0 or sent[i - 1] or hard[i - 1]))
+        if text:
+            cards.append({
+                'start_ms': toks[i]['start'],
+                'end_ms': max(toks[j]['end'], toks[i]['start'] + 1),
+                'text': text
+            })
+    return cards
+
+
 def merge_adjacent_subtitles(
     items: List[Dict],
     max_gap_ms: int = 400,
     max_duration_ms: int = 15000
 ) -> List[Dict]:
     """
-    Merge short adjacent dialogue fragments into natural, complete phrases.
-    
-    Punctuation-Driven Boundary Strategy:
-    1. Sentence-Complete Preservation: If current subtitle ends with terminal
-       punctuation (., ?, !, etc.), it is preserved as an independent card
-       and NOT arbitrarily merged into subsequent sentences.
-    2. Incomplete Fragment Continuation: If current subtitle does NOT end with
-       terminal punctuation (e.g. ends with comma, dash, conjunction, or mid-sentence),
-       it continues merging with adjacent cues across natural pauses (up to 1200ms gap)
-       until a sentence terminator is reached or max_duration_ms (default 15s) is hit.
-    3. Rolling subtitle redundancy / duplicate prefix handling.
-    4. CJK-aware text joining without unnatural spaces.
+    Smart sentence segmentation for Anki cards (the "smart segmentation" option).
+
+    Kept under its historical name for compatibility. Complete sentences are
+    preserved, very short sentences are combined with a neighbour, over-long
+    sentences are split at clause boundaries, and unpunctuated subtitles
+    (e.g. Chinese ASR subtitles) are grouped by pauses and particles.
+    max_duration_ms is the hard upper limit of one card. max_gap_ms is kept for
+    API compatibility; silences longer than max(2500, max_gap_ms) always split.
     """
     if not items:
         return []
-
-    # If any item contains an internal sentence terminal followed by a capital letter,
-    # or items overlap in time, reconstruct full sentence stream
-    has_internal_split = any(
-        re.search(r'[.?!。？！…]\s+[A-Z\u4e00-\u9fff]', it['text'])
-        for it in items[:50]
+    return segment_for_anki(
+        items,
+        max_duration_ms=max_duration_ms,
+        hard_gap_ms=max(2500, int(max_gap_ms or 0))
     )
-    has_overlap = any(
-        items[i]['end_ms'] > items[i+1]['start_ms']
-        for i in range(min(50, len(items)-1))
-    )
-    if has_internal_split or has_overlap:
-        reconstructed = reconstruct_sentences_from_cues(items, max_gap_ms=max(max_gap_ms, 1200))
-        if reconstructed:
-            items = reconstructed
-
-    merged = []
-    current = items[0].copy()
-
-    for next_item in items[1:]:
-        gap = next_item['start_ms'] - current['end_ms']
-        combined_dur = next_item['end_ms'] - current['start_ms']
-        is_finished = ends_with_sentence_terminal(current['text'])
-
-        can_merge = False
-        if not is_finished:
-            # Tolerant gap for sentence continuation (allows natural pause up to 1200ms or max_gap_ms)
-            allowed_gap = max(max_gap_ms, 1200)
-            if -200 <= gap <= allowed_gap and combined_dur <= max_duration_ms:
-                can_merge = True
-
-        if can_merge:
-            next_text = next_item['text'].strip()
-            # If next_text already includes current text (rolling caption artifact)
-            if next_text.startswith(current['text']):
-                current['text'] = next_text
-            elif not current['text'].endswith(next_text):
-                current['text'] = join_subtitle_texts(current['text'], next_text)
-            current['end_ms'] = max(current['end_ms'], next_item['end_ms'])
-        else:
-            merged.append(current)
-            current = next_item.copy()
-
-    merged.append(current)
-    return merged
-
 
 
 def filter_noise_subtitles(items: List[Dict], min_duration_ms: int = 400) -> List[Dict]:
-    """Filter out sound effects, music tags, and extremely short empty fragments."""
+    """
+    Filter out sound effects / music tags and flash cues.
+    Real speech is never dropped just for being short: short lines are joined
+    to their neighbours by the card segmenter instead.
+    """
     filtered = []
     for item in items:
         duration = item['end_ms'] - item['start_ms']
-        if duration < min_duration_ms:
+        if duration < min(min_duration_ms, 120):
             continue
         if is_sound_effect(item['text']):
             continue

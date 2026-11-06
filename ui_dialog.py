@@ -186,7 +186,12 @@ class AnkiSubDialog(QDialog):
         self.check_filter_noise.setChecked(self.cfg_filter_noise)
         opt_layout.addWidget(self.check_filter_noise)
 
-        self.check_merge_adjacent = QCheckBox("合并临近碎句 (<=400ms)")
+        self.check_merge_adjacent = QCheckBox("智能断句 (按完整句子组卡)")
+        self.check_merge_adjacent.setToolTip(
+            "开启：按完整句子生成卡片，过短的句子与相邻句合并，过长的句子在逗号/停顿处拆分，\n"
+            "无标点字幕（如中文语音识别字幕）按停顿和语气词断句。每张卡约 2.5~8 秒。\n"
+            "关闭：保持字幕文件原始的每一行。"
+        )
         self.check_merge_adjacent.setChecked(self.cfg_merge_adjacent)
         opt_layout.addWidget(self.check_merge_adjacent)
 
@@ -307,14 +312,17 @@ class AnkiSubDialog(QDialog):
         self.combo_sub1_embedded.clear()
         self.combo_sub2_embedded.clear()
 
-        # Check for companion subtitle file in the same directory (e.g. .en.vtt, .vtt, .srt, .ass)
+        # Check for companion subtitle file in the same directory (e.g. .en.vtt, .en-US.srt, .vtt, .srt, .ass)
         base_no_ext = os.path.splitext(video_path)[0]
         video_dir = os.path.dirname(video_path)
+        video_stem = os.path.basename(base_no_ext)
         companion_sub = None
         candidates = [
             f"{base_no_ext}.en.vtt",
+            f"{base_no_ext}.en-US.vtt",
             f"{base_no_ext}.vtt",
             f"{base_no_ext}.en.srt",
+            f"{base_no_ext}.en-US.srt",
             f"{base_no_ext}.srt",
             f"{base_no_ext}.ass",
             f"{base_no_ext}.ssa"
@@ -323,6 +331,15 @@ class AnkiSubDialog(QDialog):
             if os.path.isfile(c):
                 companion_sub = c
                 break
+        if not companion_sub and video_dir and os.path.isdir(video_dir):
+            prefix = video_stem.lower() + "."
+            for fname in sorted(os.listdir(video_dir)):
+                fl = fname.lower()
+                if fl.startswith(prefix) and fl.endswith(('.vtt', '.srt', '.ass', '.ssa')):
+                    full_c = os.path.join(video_dir, fname)
+                    if os.path.isfile(full_c):
+                        companion_sub = full_c
+                        break
 
         if self.embedded_tracks:
             for t in self.embedded_tracks:
@@ -330,14 +347,14 @@ class AnkiSubDialog(QDialog):
                 self.combo_sub1_embedded.addItem(item_label, t['sub_index'])
                 self.combo_sub2_embedded.addItem(item_label, t['sub_index'])
             
-            if companion_sub and not self.edit_sub1.text():
+            if companion_sub:
                 self.edit_sub1.setText(companion_sub)
                 self.combo_sub1_source.setCurrentIndex(0)
             elif not self.edit_sub1.text():
                 self.combo_sub1_source.setCurrentIndex(1)
         else:
             self.combo_sub1_source.setCurrentIndex(0)
-            if companion_sub and not self.edit_sub1.text():
+            if companion_sub:
                 self.edit_sub1.setText(companion_sub)
 
 
