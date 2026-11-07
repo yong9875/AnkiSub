@@ -163,73 +163,94 @@ BACK_TEMPLATE = """
 """
 
 
-def _migrate_existing_notes(col, model):
-    """Automatically fix and restore any existing notes whose field contents were misplaced."""
+def _safe_media_name(name):
+    """Media file names must not contain brackets: ']' terminates Anki's [sound:...] tag."""
+    import re
+    new = re.sub(r'[\[\]{}【】#%&\'`]', '_', name)
+    new = re.sub(r'_+', '_', new)
+    return new
+
+
+def _repair_media_ref(col, value, kind):
+    """Rename a bracket-containing media file and return the fixed field value."""
+    import os
+    import re
+    if kind == "sound":
+        m = re.match(r'^\s*\[sound:(.+)\]\s*$', value, re.S)
+    else:
+        m = re.search(r'<img src="([^"]+)"', value)
+    if not m:
+        return value
+    old = m.group(1)
+    new = _safe_media_name(old)
+    if new == old:
+        return value
+    media_dir = col.media.dir()
+    old_p = os.path.join(media_dir, old)
+    new_p = os.path.join(media_dir, new)
     try:
-        import re
+        if os.path.exists(old_p) and not os.path.exists(new_p):
+            os.rename(old_p, new_p)
+    except OSError:
+        return value
+    if not os.path.exists(new_p):
+        return value
+    return f"[sound:{new}]" if kind == "sound" else value.replace(old, new)
+
+
+def _migrate_existing_notes(col, model):
+    """
+    Conservative auto-repair for notes created by older AnkiSub versions:
+      * Translation that was wrongly filled with the Source (video name) is cleared.
+      * Audio/Image media whose file names contain brackets are renamed, because
+        '[sound:a_[b]_c.mp3]' is cut at the first ']' and the audio never plays.
+      * Audio/Image tags that ended up in another field are moved back.
+    Correct notes are never touched.
+    """
+    try:
+        names = col.models.field_names(model)
         nids = col.find_notes(f"mid:{model['id']}")
         for nid in nids:
             note = col.get_note(nid)
-            vals = list(note.values())
-            audio = ""
-            img = ""
-            time_val = ""
-            src = ""
-            expr = ""
-            trans = ""
+            changed = False
 
-            for v in vals:
-                v_str = str(v).strip()
-                if not v_str:
+            def get(f):
+                return note[f] if f in names else ""
+
+            # Move misplaced media tags back to Audio/Image
+            for f in names:
+                if f in ("Audio", "Image"):
                     continue
-                if v_str.startswith("[sound:") and v_str.endswith("]"):
-                    audio = v_str
-                elif "<img src=" in v_str:
-                    img = v_str
-                elif re.search(r"\d{2}:\d{2}:\d{2}[\.,]\d{3}\s*-\s*\d{2}:\d{2}:\d{2}", v_str):
-                    time_val = v_str
-                elif ("." in v_str and not " " in v_str) or "1080p" in v_str or "720p" in v_str or "BluRay" in v_str:
-                    src = v_str
-                elif not expr:
-                    expr = v_str
-                elif not trans and not v_str.startswith("[sound:") and not v_str.startswith("<img"):
-                    trans = v_str
+                v = str(note[f]).strip()
+                if "Audio" in names and v.startswith("[sound:") and v.endswith("]") and not get("Audio").strip():
+                    note["Audio"] = v
+                    note[f] = ""
+                    changed = True
+                elif "Image" in names and v.startswith("<img") and not get("Image").strip():
+                    note["Image"] = v
+                    note[f] = ""
+                    changed = True
 
-            cur_audio = note["Audio"] if "Audio" in note else ""
-            cur_img = note["Image"] if "Image" in note else ""
-            cur_words = note["Words"] if "Words" in note else ""
-            cur_notes = note["Notes"] if "Notes" in note else ""
-            cur_trans = note["Translation"] if "Translation" in note else ""
+            # Translation must never be a copy of the Source name
+            src = get("Source").strip()
+            trans = get("Translation").strip()
+            if "Translation" in names and trans and src and trans == src:
+                note["Translation"] = ""
+                changed = True
 
-            needs_fix = False
-            if audio and cur_audio != audio:
-                needs_fix = True
-            if img and cur_img != img:
-                needs_fix = True
-            if cur_words.startswith("[sound:") or cur_words.startswith("<img") or cur_words == src:
-                needs_fix = True
-            if cur_notes.startswith("[sound:") or cur_notes.startswith("<img") or cur_notes == time_val:
-                needs_fix = True
-            if cur_trans.startswith("<img") or cur_trans.startswith("[sound:"):
-                needs_fix = True
+            # Bracket-free media file names so [sound:] / <img> resolve
+            if "Audio" in names and get("Audio"):
+                fixed = _repair_media_ref(col, get("Audio"), "sound")
+                if fixed != get("Audio"):
+                    note["Audio"] = fixed
+                    changed = True
+            if "Image" in names and get("Image"):
+                fixed = _repair_media_ref(col, get("Image"), "img")
+                if fixed != get("Image"):
+                    note["Image"] = fixed
+                    changed = True
 
-            if needs_fix:
-                if "Expression" in note and expr:
-                    note["Expression"] = expr
-                if "Words" in note and (cur_words.startswith("[sound:") or cur_words.startswith("<img") or cur_words == src):
-                    note["Words"] = ""
-                if "Notes" in note and (cur_notes.startswith("[sound:") or cur_notes.startswith("<img") or cur_notes == time_val):
-                    note["Notes"] = ""
-                if "Translation" in note:
-                    note["Translation"] = "" if (cur_trans.startswith("<img") or cur_trans.startswith("[sound:")) else trans
-                if "Audio" in note and audio:
-                    note["Audio"] = audio
-                if "Image" in note and img:
-                    note["Image"] = img
-                if "Source" in note and src:
-                    note["Source"] = src
-                if "Time" in note and time_val:
-                    note["Time"] = time_val
+            if changed:
                 col.update_note(note)
     except Exception as e:
         print(f"[AnkiSub] Note auto-repair error: {e}")

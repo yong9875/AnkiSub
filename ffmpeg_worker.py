@@ -155,8 +155,11 @@ def extract_embedded_subtitle(video_path: str, sub_stream_index: int) -> Optiona
 
 def sanitize_filename(name: str) -> str:
     """Sanitize string to be safe as file basename."""
-    name = re.sub(r'[\\/*?:"<>|]', '_', name)
-    name = re.sub(r'\s+', '_', name).strip('._')
+    # Square/curly brackets break Anki's [sound:...] tag parsing (the first ']' ends the tag),
+    # so they are removed together with characters that are illegal in file names.
+    name = re.sub(r'[\\/*?:"<>|\[\]{}【】#%&\'`]', '_', name)
+    name = re.sub(r'\s+', '_', name)
+    name = re.sub(r'_+', '_', name).strip('._')
     return name[:60] if len(name) > 60 else name
 
 
